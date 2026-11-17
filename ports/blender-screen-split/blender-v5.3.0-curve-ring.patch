@@ -1,0 +1,111 @@
+diff --git a/source/blender/blenkernel/CMakeLists.txt b/source/blender/blenkernel/CMakeLists.txt
+index 3323a3a..a167004 100644
+--- a/source/blender/blenkernel/CMakeLists.txt
++++ b/source/blender/blenkernel/CMakeLists.txt
+@@ -770,6 +770,8 @@ add_library(bf::blenkernel ALIAS bf_blenkernel)
+ if(BLENDER_RUST_SCREEN_SPLIT_LIB)
+   set_property(SOURCE intern/armature_deform.cc APPEND PROPERTY COMPILE_DEFINITIONS
+     WITH_BLENDER_RUST_ARMATURE)
++  set_property(SOURCE intern/curve_to_mesh_convert.cc APPEND PROPERTY COMPILE_DEFINITIONS
++    WITH_BLENDER_RUST_CURVE_RING)
+   target_link_libraries(bf_blenkernel PRIVATE "${BLENDER_RUST_SCREEN_SPLIT_LIB}")
+ endif()
+
+diff --git a/source/blender/blenkernel/intern/curve_to_mesh_convert.cc b/source/blender/blenkernel/intern/curve_to_mesh_convert.cc
+index 2808436..5cf5ee2 100644
+--- a/source/blender/blenkernel/intern/curve_to_mesh_convert.cc
++++ b/source/blender/blenkernel/intern/curve_to_mesh_convert.cc
+@@ -6,6 +6,8 @@
+  * \ingroup bke
+  */
+
++#include <cstddef>
++#include <cstdint>
+ #include <limits>
+ #include <numbers>
+
+@@ -254,6 +256,28 @@ static float4x4 build_point_matrix(const Span<float3> main_positions,
+   return point_matrix;
+ }
+
++#ifdef WITH_BLENDER_RUST_CURVE_RING
++constexpr int rust_curve_ring_size = 10;
++
++/* Keep these value types in sync with ports/blender-screen-split/curve_ring.rs. */
++struct RustCurveRingMatrix {
++  float columns[4][3];
++};
++
++struct RustCurveRingPoints {
++  float points[rust_curve_ring_size][3];
++};
++
++static_assert(sizeof(RustCurveRingMatrix) == 48 && alignof(RustCurveRingMatrix) == 4);
++static_assert(sizeof(RustCurveRingPoints) == 120 && alignof(RustCurveRingPoints) == 4);
++static_assert(offsetof(RustCurveRingMatrix, columns) == 0);
++static_assert(offsetof(RustCurveRingPoints, points) == 0);
++
++extern "C" RustCurveRingPoints blender_rust_curve_ring(RustCurveRingMatrix matrix,
++                                                       RustCurveRingPoints profile,
++                                                       uint32_t trace_rings);
++#endif
++
+ static void fill_mesh_positions(const Span<float3> main_positions,
+                                 const Span<float3> profile_positions,
+                                 const Span<float3> tangents,
+@@ -261,8 +285,45 @@ static void fill_mesh_positions(const Span<float3> main_positions,
+                                 const Span<float> scales,
+                                 const bool main_cyclic,
+                                 const std::optional<float> miter_scale_limit,
+-                                MutableSpan<float3> mesh_positions)
++                                MutableSpan<float3> mesh_positions,
++                                [[maybe_unused]] const bool profile_cyclic)
+ {
++#ifdef WITH_BLENDER_RUST_CURVE_RING
++  if (profile_positions.size() == rust_curve_ring_size && profile_cyclic && !main_cyclic &&
++      scales.is_empty() && !miter_scale_limit && main_positions.size() > 0 &&
++      main_positions.size() <= 1024)
++  {
++    RustCurveRingPoints profile;
++    bool planar = true;
++    for (const int p : IndexRange(rust_curve_ring_size)) {
++      for (const int i : IndexRange(3)) {
++        profile.points[p][i] = profile_positions[p][i];
++      }
++      planar &= profile.points[p][2] == 0.0f;
++    }
++
++    if (planar) {
++      for (const int i_ring : main_positions.index_range()) {
++        const float4x4 point_matrix = build_point_matrix(
++            main_positions, tangents, normals, scales, main_cyclic, miter_scale_limit, i_ring);
++        RustCurveRingMatrix matrix;
++        for (const int c : IndexRange(4)) {
++          for (const int i : IndexRange(3)) {
++            matrix.columns[c][i] = point_matrix[c][i];
++          }
++        }
++        const uint32_t trace = i_ring == 0 ? uint32_t(main_positions.size()) : 0;
++        const RustCurveRingPoints positions = blender_rust_curve_ring(matrix, profile, trace);
++        const int ring_start = i_ring * rust_curve_ring_size;
++        for (const int p : IndexRange(rust_curve_ring_size)) {
++          const float *co = positions.points[p];
++          mesh_positions[ring_start + p] = float3(co[0], co[1], co[2]);
++        }
++      }
++      return;
++    }
++  }
++#endif
+   if (profile_positions.size() == 1) {
+     for (const int i_ring : main_positions.index_range()) {
+       const float4x4 point_matrix = build_point_matrix(
+@@ -591,6 +652,7 @@ static void build_mesh_positions(const CurvesInfo &curves_info,
+                         eval_scales.is_empty() ? eval_scales : eval_scales.slice(info.main_points),
+                         info.main_cyclic,
+                         miter_scale_limit,
+-                        positions.slice(info.vert_range));
++                        positions.slice(info.vert_range),
++                        info.profile_cyclic);
+   });
+ }

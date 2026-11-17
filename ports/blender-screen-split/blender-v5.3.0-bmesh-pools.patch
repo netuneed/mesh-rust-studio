@@ -1,0 +1,279 @@
+diff --git a/source/blender/blenlib/BLI_mempool_bulk_init.hh b/source/blender/blenlib/BLI_mempool_bulk_init.hh
+new file mode 100644
+--- /dev/null
++++ b/source/blender/blenlib/BLI_mempool_bulk_init.hh
+@@ -0,0 +1,25 @@
++/* SPDX-FileCopyrightText: 2008 Blender Authors
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later */
++
++#pragma once
++
++#include <cstdint>
++
++namespace blender {
++struct BLI_mempool;
++
++/** Fill the free-list links of a detached chunk. Return false before any write to use C++. */
++using BLI_mempool_chunk_init = uint8_t (*)(void *data,
++                                        unsigned int count,
++                                        unsigned int stride,
++                                        unsigned int iter_flag,
++                                        intptr_t freeword);
++
++/** Create the same pool as BLI_mempool_create, with bounded parallel initial chunk setup. */
++BLI_mempool *BLI_mempool_create_bulk_init(unsigned int esize,
++                                          unsigned int elem_num,
++                                          unsigned int pchunk,
++                                          unsigned int flag,
++                                          BLI_mempool_chunk_init init);
++}  // namespace blender
+diff --git a/source/blender/blenlib/CMakeLists.txt b/source/blender/blenlib/CMakeLists.txt
+--- a/source/blender/blenlib/CMakeLists.txt
++++ b/source/blender/blenlib/CMakeLists.txt
+@@ -504,4 +504,10 @@
+
+ blender_add_lib(bf_blenlib "${SRC}" "${INC}" "${INC_SYS}" "${LIB}")
++
++if(BLENDER_RUST_SCREEN_SPLIT_LIB)
++  # This file is separately compiled without this definition by makesdna.
++  set_property(SOURCE intern/BLI_mempool.cc APPEND PROPERTY
++    COMPILE_DEFINITIONS WITH_BLENDER_RUST_BMESH_POOL)
++endif()
+ add_library(bf::blenlib ALIAS bf_blenlib)
+
+diff --git a/source/blender/blenlib/intern/BLI_mempool.cc b/source/blender/blenlib/intern/BLI_mempool.cc
+--- a/source/blender/blenlib/intern/BLI_mempool.cc
++++ b/source/blender/blenlib/intern/BLI_mempool.cc
+@@ -25,6 +25,15 @@
+ #include "BLI_asan.hh"
+ #include "BLI_math_base_c.hh"
+-#include "BLI_mempool.hh"        /* own include */
++#include "BLI_mempool.hh"         /* own include */
++#include "BLI_mempool_bulk_init.hh"
+ #include "BLI_mempool_private.h" /* own include */
++
++#if defined(WITH_BLENDER_RUST_BMESH_POOL) && !defined(WITH_ASAN) && !defined(WITH_MEM_VALGRIND)
++#  define BLI_MEMPOOL_BULK_INIT
++#  include <cstdio>
++#  include <cstdlib>
++
++#  include "BLI_task.hh"
++#endif
+
+ #ifdef WITH_ASAN
+@@ -318,9 +327,97 @@
+ }
+
+-BLI_mempool *BLI_mempool_create(uint esize, uint elem_num, uint pchunk, uint flag)
++#ifdef BLI_MEMPOOL_BULK_INIT
++static bool mempool_initialize_detached_chunk(const BLI_mempool *pool,
++                                              BLI_mempool_chunk *chunk,
++                                              const BLI_mempool_chunk_init init)
++{
++  static_assert(sizeof(BLI_freenode) == 2 * sizeof(void *));
++  static_assert(alignof(BLI_freenode) == alignof(void *));
++  static_assert(offsetof(BLI_freenode, next) == 0);
++  static_assert(offsetof(BLI_freenode, freeword) == sizeof(void *));
++  BLI_freenode *node = CHUNK_DATA(chunk);
++  const uint esize = pool->esize;
++  const uint iter = (pool->flag & BLI_MEMPOOL_ALLOW_ITER) ? 1 : 0;
++  if (init && init(node, pool->pchunk, esize, iter, FREEWORD)) {
++    return true;
++  }
++
++  if (iter) {
++    for (uint i = 0; i < pool->pchunk; i++) {
++      node->freeword = FREEWORD;
++      node->next = i + 1 == pool->pchunk ? nullptr : NODE_STEP_NEXT(node);
++      node = NODE_STEP_NEXT(node);
++    }
++  }
++  else {
++    for (uint i = 0; i < pool->pchunk; i++) {
++      node->next = i + 1 == pool->pchunk ? nullptr : NODE_STEP_NEXT(node);
++      node = NODE_STEP_NEXT(node);
++    }
++  }
++  return false;
++}
++
++static void mempool_init_bulk(BLI_mempool *pool, const BLI_mempool_chunk_init init)
++{
++  /* Keep guarded allocations and list assembly in the same order as stock creation. The
++   * tasks only touch the detached chunks before publication. Bound the scratch table. */
++  constexpr uint batch_size = 512;
++  BLI_mempool_chunk *chunks[batch_size];
++  bool initialized_in_rust[batch_size];
++  const char *trace_value = std::getenv("BLENDER_RUST_BMESH_POOL_TRACE");
++  const bool trace = trace_value && trace_value[0] == '1' && trace_value[1] == '\0';
++  uint rust_chunks = 0;
++  BLI_freenode *last_tail = nullptr;
++  const uint esize = pool->esize;
++  for (uint done = 0; done < pool->maxchunks;) {
++    const uint count = std::min(batch_size, pool->maxchunks - done);
++    for (uint i = 0; i < count; i++) {
++      chunks[i] = mempool_chunk_alloc(pool);
++    }
++    threading::parallel_for(IndexRange(count), 16, [&](const IndexRange range) {
++      for (const int64_t i : range) {
++        initialized_in_rust[i] = mempool_initialize_detached_chunk(pool, chunks[i], init);
++      }
++    });
++    for (uint i = 0; i < count; i++) {
++      BLI_mempool_chunk *chunk = chunks[i];
++      BLI_freenode *first = CHUNK_DATA(chunk);
++      if (pool->chunk_tail) {
++        pool->chunk_tail->next = chunk;
++        last_tail->next = first;
++      }
++      else {
++        pool->chunks = chunk;
++        pool->free = first;
++      }
++      chunk->next = nullptr;
++      pool->chunk_tail = chunk;
++      last_tail = reinterpret_cast<BLI_freenode *>(
++          reinterpret_cast<char *>(first) + (pool->pchunk - 1) * esize);
++      rust_chunks += initialized_in_rust[i];
++    }
++    done += count;
++  }
++  if (trace) {
++    std::fprintf(stderr,
++                 "RUST_BMESH_POOL chunks=%u rust_chunks=%u slots_per_chunk=%u stride=%u\n",
++                 pool->maxchunks,
++                 rust_chunks,
++                 pool->pchunk,
++                 esize);
++  }
++}
++#endif
++
++static BLI_mempool *mempool_create_impl(uint esize,
++                                      uint elem_num,
++                                      uint pchunk,
++                                      uint flag,
++                                      const bool bulk_init,
++                                      const BLI_mempool_chunk_init init)
+ {
+   BLI_mempool *pool;
+-  BLI_freenode *last_tail = nullptr;
+-  uint i, maxchunks;
++  uint maxchunks;
+
+   /* allocate the pool structure */
+@@ -370,7 +467,17 @@
+   pool->totused = 0;
+
++#ifdef BLI_MEMPOOL_BULK_INIT
++  if (elem_num && bulk_init && maxchunks >= 64) {
++    mempool_init_bulk(pool, init);
++    return pool;
++  }
++#else
++  UNUSED_VARS(bulk_init, init);
++#endif
++
+   if (elem_num) {
+     /* Allocate the actual chunks. */
+-    for (i = 0; i < maxchunks; i++) {
++    BLI_freenode *last_tail = nullptr;
++    for (uint i = 0; i < maxchunks; i++) {
+       BLI_mempool_chunk *mpchunk = mempool_chunk_alloc(pool);
+       last_tail = mempool_chunk_add(pool, mpchunk, last_tail);
+@@ -384,4 +491,17 @@
+   return pool;
+ }
++
++BLI_mempool *BLI_mempool_create(uint esize, uint elem_num, uint pchunk, uint flag)
++{
++  return mempool_create_impl(esize, elem_num, pchunk, flag, false, nullptr);
++}
++
++#ifdef BLI_MEMPOOL_BULK_INIT
++BLI_mempool *BLI_mempool_create_bulk_init(
++    uint esize, uint elem_num, uint pchunk, uint flag, BLI_mempool_chunk_init init)
++{
++  return mempool_create_impl(esize, elem_num, pchunk, flag, true, init);
++}
++#endif
+
+ void *BLI_mempool_alloc(BLI_mempool *pool)
+diff --git a/source/blender/bmesh/CMakeLists.txt b/source/blender/bmesh/CMakeLists.txt
+--- a/source/blender/bmesh/CMakeLists.txt
++++ b/source/blender/bmesh/CMakeLists.txt
+@@ -198,4 +198,10 @@
+ add_library(bf::bmesh ALIAS bf_bmesh)
+
++if(BLENDER_RUST_SCREEN_SPLIT_LIB)
++  set_property(SOURCE intern/bmesh_mesh.cc APPEND PROPERTY
++    COMPILE_DEFINITIONS WITH_BLENDER_RUST_BMESH_POOL)
++  target_link_libraries(bf_bmesh PRIVATE "${BLENDER_RUST_SCREEN_SPLIT_LIB}")
++endif()
++
+ if(MSVC AND NOT MSVC_CLANG)
+   target_compile_options(bf_bmesh PRIVATE /WX /wd4101)
+diff --git a/source/blender/bmesh/intern/bmesh_mesh.cc b/source/blender/bmesh/intern/bmesh_mesh.cc
+--- a/source/blender/bmesh/intern/bmesh_mesh.cc
++++ b/source/blender/bmesh/intern/bmesh_mesh.cc
+@@ -9,4 +9,11 @@
+  */
+
++#if defined(WITH_BLENDER_RUST_BMESH_POOL) && !defined(WITH_ASAN) && !defined(WITH_MEM_VALGRIND)
++#  define BMESH_RUST_POOL_INIT
++#  include <cstdlib>
++
++#  include "BLI_mempool_bulk_init.hh"
++#endif
++
+ #include "MEM_guardedalloc.h"
+
+@@ -26,4 +33,25 @@
+ const BMAllocTemplate bm_mesh_allocsize_default = {512, 1024, 2048, 512};
+ const BMAllocTemplate bm_mesh_chunksize_default = {512, 1024, 2048, 512};
++
++#ifdef BMESH_RUST_POOL_INIT
++extern "C" uint8_t blender_rust_bmesh_pool_chunk(
++    void *data, uint count, uint stride, uint iter_flag, intptr_t freeword);
++#endif
++
++static BLI_mempool *bm_mempool_create(uint elem_size, uint count, uint chunk_size, uint flags)
++{
++#ifdef BMESH_RUST_POOL_INIT
++  if (count >= 65536) {
++    const char *stock = std::getenv("BLENDER_RUST_BMESH_POOL_CPP");
++    if (!(stock && stock[0] == '1' && stock[1] == '\0')) {
++      const char *cpp_init = std::getenv("BLENDER_RUST_BMESH_POOL_INIT_CPP");
++      const bool use_cpp_init = cpp_init && cpp_init[0] == '1' && cpp_init[1] == '\0';
++      return BLI_mempool_create_bulk_init(
++          elem_size, count, chunk_size, flags, use_cpp_init ? nullptr : blender_rust_bmesh_pool_chunk);
++    }
++  }
++#endif
++  return BLI_mempool_create(elem_size, count, chunk_size, flags);
++}
+
+ static void bm_mempool_init_ex(const BMAllocTemplate *allocsize,
+@@ -50,17 +78,17 @@
+
+   if (r_vpool) {
+-    *r_vpool = BLI_mempool_create(
++    *r_vpool = bm_mempool_create(
+         vert_size, allocsize->totvert, bm_mesh_chunksize_default.totvert, BLI_MEMPOOL_ALLOW_ITER);
+   }
+   if (r_epool) {
+-    *r_epool = BLI_mempool_create(
++    *r_epool = bm_mempool_create(
+         edge_size, allocsize->totedge, bm_mesh_chunksize_default.totedge, BLI_MEMPOOL_ALLOW_ITER);
+   }
+   if (r_lpool) {
+-    *r_lpool = BLI_mempool_create(
++    *r_lpool = bm_mempool_create(
+         loop_size, allocsize->totloop, bm_mesh_chunksize_default.totloop, BLI_MEMPOOL_NOP);
+   }
+   if (r_fpool) {
+-    *r_fpool = BLI_mempool_create(
++    *r_fpool = bm_mempool_create(
+         face_size, allocsize->totface, bm_mesh_chunksize_default.totface, BLI_MEMPOOL_ALLOW_ITER);
+   }

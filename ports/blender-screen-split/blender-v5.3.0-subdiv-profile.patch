@@ -1,0 +1,545 @@
+diff --git a/source/blender/blenlib/BLI_subdivision_profile.hh b/source/blender/blenlib/BLI_subdivision_profile.hh
+new file mode 100644
+--- /dev/null
++++ b/source/blender/blenlib/BLI_subdivision_profile.hh
+@@ -0,0 +1,40 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++#pragma once
++
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
++
++namespace blender::subdivision_profile {
++
++/* Test-only diagnostics. Production and timing runs leave this off. */
++inline bool enabled()
++{
++  static const bool value = [] {
++    const char *env = std::getenv("BLENDER_SUBDIVISION_PROFILE");
++    return env && env[0] == '1' && env[1] == '\0';
++  }();
++  return value;
++}
++
++using Clock = std::chrono::steady_clock;
++using Point = Clock::time_point;
++
++inline Point start()
++{
++  return enabled() ? Clock::now() : Point{};
++}
++
++inline double elapsed(const Point begin)
++{
++  return std::chrono::duration<double, std::milli>(Clock::now() - begin).count();
++}
++
++inline void report(const char *phase, const Point begin)
++{
++  if (enabled()) {
++    std::fprintf(stderr, "SUBDIV_PHASE name=%s ms=%.6f\n", phase, elapsed(begin));
++  }
++}
++
++}  // namespace blender::subdivision_profile
+--- a/source/blender/bmesh/intern/bmesh_mesh_convert.cc
++++ b/source/blender/bmesh/intern/bmesh_mesh_convert.cc
+@@ -82,6 +82,7 @@
+ #include "MEM_guardedalloc.h"
+
+ #include "BLI_array.hh"
++#include "BLI_subdivision_profile.hh"
+ #include "BLI_index_range.hh"
+ #include "BLI_listbase.hh"
+ #include "BLI_math_vector_c.hh"
+@@ -317,6 +318,7 @@
+
+ void BM_mesh_bm_from_me(BMesh *bm, const Mesh *mesh, const BMeshFromMeshParams *params)
+ {
++  const auto profile_begin = subdivision_profile::start();
+   if (!mesh) {
+     /* Sanity check. */
+     return;
+@@ -544,6 +546,8 @@
+                                          !uv_select_edge.is_empty() && !uv_select_face.is_empty());
+
+   const Span<float3> positions = mesh->vert_positions();
++  subdivision_profile::report("bmesh_customdata_setup", profile_begin);
++  const auto profile_verts = subdivision_profile::start();
+   Array<BMVert *> vtable(mesh->verts_num);
+   for (const int i : positions.index_range()) {
+     BMVert *v = vtable[i] = BM_vert_create(
+@@ -581,6 +585,8 @@
+   }
+
+   const Span<int2> edges = mesh->edges();
++  subdivision_profile::report("bmesh_vertices_with_data", profile_verts);
++  const auto profile_edges = subdivision_profile::start();
+   Array<BMEdge *> etable(mesh->edges_num);
+   for (const int i : edges.index_range()) {
+     BMEdge *e = etable[i] = BM_edge_create(
+@@ -608,6 +614,8 @@
+   }
+
+   const OffsetIndices faces = mesh->faces();
++  subdivision_profile::report("bmesh_edges_with_disk_and_data", profile_edges);
++  const auto profile_faces = subdivision_profile::start();
+   const Span<int> corner_verts = mesh->corner_verts();
+   const Span<int> corner_edges = mesh->corner_edges();
+
+@@ -693,6 +701,7 @@
+     bm->elem_index_dirty &= ~(BM_FACE | BM_LOOP); /* Added in order, clear dirty flag. */
+   }
+
++  subdivision_profile::report("bmesh_faces_with_radial_and_data", profile_faces);
+   bm->uv_select_sync_valid = (need_uv_select && (mesh->flag & ME_FLAG_UV_SELECT_SYNC_VALID)) != 0;
+
+   /* -------------------------------------------------------------------- */
+@@ -729,6 +738,7 @@
+   else {
+     BM_select_history_clear(bm);
+   }
++  subdivision_profile::report("bmesh_from_mesh_total", profile_begin);
+ }
+
+ /**
+--- a/source/blender/blenkernel/intern/editmesh.cc
++++ b/source/blender/blenkernel/intern/editmesh.cc
+@@ -6,6 +6,9 @@
+  * \ingroup bke
+  */
+
++#include <bit>
++#include <cinttypes>
++
+ #include "MEM_guardedalloc.h"
+
+ #include "DNA_mesh_types.h"
+@@ -14,6 +17,7 @@
+ #include "BLI_bitmap.hh"
+ #include "BLI_math_geom_c.hh"
+ #include "BLI_math_vector_c.hh"
++#include "BLI_subdivision_profile.hh"
+
+ #include "BKE_customdata.hh"
+ #include "BKE_editmesh.hh"
+@@ -119,14 +123,127 @@
+   BKE_editmesh_looptris_calc_ex(em, bm, &params);
+ }
+
++static void subdivision_bmesh_fingerprint(BMEditMesh *em, BMesh *bm)
++{
++  static const bool verify = [] {
++    const char *value = std::getenv("BLENDER_SUBDIVISION_BMESH_HASH");
++    return value && value[0] == '1' && value[1] == '\0';
++  }();
++  if (!verify || (bm->elem_index_dirty & (BM_VERT | BM_EDGE | BM_FACE | BM_LOOP))) {
++    return;
++  }
++
++  struct Fingerprint {
++    uint64_t value = 14695981039346656037ULL;
++    void add(const uint32_t data)
++    {
++      value = (value ^ data) * 1099511628211ULL;
++    }
++    void add_index(const BMElem *element)
++    {
++      this->add(element ? uint32_t(BM_elem_index_get(element)) : UINT32_MAX);
++    }
++    void add_floats(const float *data, const int count)
++    {
++      for (int i = 0; i < count; ++i) {
++        this->add(std::bit_cast<uint32_t>(data[i]));
++      }
++    }
++  } vertices, edges, faces, loops, normals, triangles, uv;
++
++  const int uv_layer = CustomData_get_offset(&bm->ldata, CD_PROP_FLOAT2);
++  const int face_loop_limit = bm->totloop;
++  int seen_loops = 0;
++  BMIter iter;
++  BMVert *vert;
++  BM_ITER_MESH (vert, &iter, bm, BM_VERTS_OF_MESH) {
++    vertices.add_floats(vert->co, 3);
++    vertices.add(vert->head.hflag);
++    vertices.add_index(reinterpret_cast<const BMElem *>(vert->e));
++    normals.add_floats(vert->no, 3);
++  }
++  BMEdge *edge;
++  BM_ITER_MESH (edge, &iter, bm, BM_EDGES_OF_MESH) {
++    edges.add_index(reinterpret_cast<const BMElem *>(edge->v1));
++    edges.add_index(reinterpret_cast<const BMElem *>(edge->v2));
++    edges.add_index(reinterpret_cast<const BMElem *>(edge->l));
++    edges.add_index(reinterpret_cast<const BMElem *>(edge->v1_disk_link.next));
++    edges.add_index(reinterpret_cast<const BMElem *>(edge->v1_disk_link.prev));
++    edges.add_index(reinterpret_cast<const BMElem *>(edge->v2_disk_link.next));
++    edges.add_index(reinterpret_cast<const BMElem *>(edge->v2_disk_link.prev));
++    edges.add(edge->head.hflag);
++  }
++  BMFace *face;
++  BM_ITER_MESH (face, &iter, bm, BM_FACES_OF_MESH) {
++    faces.add(face->len);
++    faces.add(face->mat_nr);
++    faces.add(face->head.hflag);
++    normals.add_floats(face->no, 3);
++    const BMLoop *first = BM_FACE_FIRST_LOOP(face);
++    const BMLoop *loop = first;
++    for (int i = 0; i < face->len; ++i, loop = loop->next) {
++      if (loop == nullptr || ++seen_loops > face_loop_limit || (i > 0 && loop == first)) {
++        std::fprintf(stderr, "SUBDIV_BMESH_HASH_ERROR invalid face loop cycle\n");
++        return;
++      }
++      loops.add_index(reinterpret_cast<const BMElem *>(loop));
++      loops.add_index(reinterpret_cast<const BMElem *>(loop->v));
++      loops.add_index(reinterpret_cast<const BMElem *>(loop->e));
++      loops.add_index(reinterpret_cast<const BMElem *>(loop->next));
++      loops.add_index(reinterpret_cast<const BMElem *>(loop->prev));
++      loops.add_index(reinterpret_cast<const BMElem *>(loop->radial_next));
++      loops.add_index(reinterpret_cast<const BMElem *>(loop->radial_prev));
++      loops.add(loop->head.hflag);
++      if (uv_layer >= 0) {
++        uv.add_floats(*BM_ELEM_CD_GET_FLOAT2_P(loop, uv_layer), 2);
++      }
++    }
++    if (loop != first) {
++      std::fprintf(stderr, "SUBDIV_BMESH_HASH_ERROR unterminated face loop cycle\n");
++      return;
++    }
++  }
++  if (seen_loops != face_loop_limit) {
++    std::fprintf(stderr, "SUBDIV_BMESH_HASH_ERROR unexpected face loop count\n");
++    return;
++  }
++  for (const auto &triangle : em->looptris) {
++    for (const BMLoop *loop : triangle) {
++      triangles.add_index(reinterpret_cast<const BMElem *>(loop));
++    }
++  }
++  std::fprintf(stderr,
++               "SUBDIV_BMESH_HASH counts=%d,%d,%d,%d tris=%" PRId64
++               " vertices=%016" PRIx64 " edges=%016" PRIx64 " faces=%016" PRIx64
++               " loops=%016" PRIx64 " normals=%016" PRIx64 " looptris=%016" PRIx64
++               " uv=%016" PRIx64 "\n",
++               bm->totvert,
++               bm->totedge,
++               bm->totface,
++               bm->totloop,
++               int64_t(em->looptris.size()),
++               vertices.value,
++               edges.value,
++               faces.value,
++               loops.value,
++               normals.value,
++               triangles.value,
++               uv.value);
++}
++
+ void BKE_editmesh_looptris_and_normals_calc(BMEditMesh *em, BMesh *bm)
+ {
++  const auto profile_tris = subdivision_profile::start();
+   BMeshCalcTessellation_Params looptris_params{};
+   looptris_params.face_normals = true;
+   BKE_editmesh_looptris_calc_ex(em, bm, &looptris_params);
++  subdivision_profile::report("edit_looptris_with_face_normals", profile_tris);
++  const auto profile_normals = subdivision_profile::start();
+   BMeshNormalsUpdate_Params normals_params{};
+   normals_params.face_normals = false;
+   BM_mesh_normals_update_ex(bm, &normals_params);
++  subdivision_profile::report("edit_vertex_normals", profile_normals);
++  subdivision_bmesh_fingerprint(em, bm);
+ }
+
+ void BKE_editmesh_looptris_calc_with_partial_ex(BMEditMesh *em,
+--- a/source/blender/blenkernel/intern/mesh.cc
++++ b/source/blender/blenkernel/intern/mesh.cc
+@@ -60,6 +60,7 @@
+ #include "BKE_main.hh"
+ #include "BKE_material.hh"
+ #include "BKE_mesh.hh"
++#include "BLI_subdivision_profile.hh"
+ #include "BKE_mesh_legacy_convert.hh"
+ #include "BKE_mesh_runtime.hh"
+ #include "BKE_mesh_wrapper.hh"
+@@ -1584,9 +1585,11 @@
+                             const BMeshCreateParams *create_params,
+                             const BMeshFromMeshParams *convert_params)
+ {
++  const auto profile_pool = subdivision_profile::start();
+   const BMAllocTemplate allocsize = BMALLOC_TEMPLATE_FROM_ME(mesh);
+
+   BMesh *bm = BM_mesh_create(&allocsize, create_params);
++  subdivision_profile::report("bmesh_pools", profile_pool);
+   BM_mesh_bm_from_me(bm, mesh, convert_params);
+
+   return bm;
+--- a/source/blender/editors/object/object_edit.cc
++++ b/source/blender/editors/object/object_edit.cc
+@@ -21,6 +21,7 @@
+ #include "BLI_string.hh"
+ #include "BLI_string_utf8.hh"
+ #include "BLI_utildefines.hh"
++#include "BLI_subdivision_profile.hh"
+
+ #include "BLT_translation.hh"
+
+@@ -897,14 +898,18 @@
+
+     const bool use_key_index = mesh_needs_keyindex(bmain, id_cast<const Mesh *>(ob->data));
+
++    const auto profile_make = subdivision_profile::start();
+     EDBM_mesh_make(ob, scene->toolsettings->selectmode, use_key_index);
++    subdivision_profile::report("edit_edbm_mesh_make", profile_make);
+
+     BMEditMesh *em = BKE_editmesh_from_object(ob);
+     if (em) [[likely]] {
+       BKE_editmesh_looptris_and_normals_calc(em, BKE_editmesh_bmesh_get_for_write(ob));
+     }
+
++    const auto profile_notifier = subdivision_profile::start();
+     WM_main_add_notifier(NC_SCENE | ND_MODE | NS_EDITMODE_MESH, nullptr);
++    subdivision_profile::report("edit_mesh_notifier", profile_notifier);
+   }
+   else if (ob->type == OB_ARMATURE) {
+     /* Syncing the selection to the `Bone` before converting to edit bones. This is not possible if
+--- a/source/blender/editors/object/object_modifier.cc
++++ b/source/blender/editors/object/object_modifier.cc
+@@ -34,6 +34,7 @@
+ #include "BLI_string_utf8.hh"
+ #include "BLI_string_utils.hh"
+ #include "BLI_utildefines.hh"
++#include "BLI_subdivision_profile.hh"
+
+ #include "BKE_animsys.hh"
+ #include "BKE_anonymous_attribute_id.hh"
+@@ -1083,6 +1084,7 @@
+       }
+     }
+     else {
++      const auto profile_evaluation = subdivision_profile::start();
+       Mesh *mesh_applied = create_applied_mesh_for_modifier(
+           depsgraph,
+           DEG_get_evaluated_scene(depsgraph),
+@@ -1093,10 +1095,14 @@
+           false,
+           true,
+           reports);
++      if (md_eval->type == eModifierType_Subsurf) {
++        subdivision_profile::report("apply_evaluate_modifier_mesh", profile_evaluation);
++      }
+       if (!mesh_applied) {
+         return false;
+       }
+
++      const auto profile_transfer = subdivision_profile::start();
+       Main *bmain = DEG_get_bmain(depsgraph);
+       BKE_object_material_from_eval_data(bmain, ob, &mesh_applied->id);
+       BKE_mesh_nomain_to_mesh(mesh_applied, mesh, ob);
+@@ -1109,6 +1115,9 @@
+
+       /* Make sure that if there are uv maps, one is marked as active. */
+       bke::mesh_ensure_active_uv_map(*mesh);
++      if (md_eval->type == eModifierType_Subsurf) {
++        subdivision_profile::report("apply_transfer_and_attributes", profile_transfer);
++      }
+
+       if (md_eval->type == eModifierType_Multires) {
+         multires_customdata_delete(mesh);
+@@ -2045,6 +2054,7 @@
+     }
+     changed = true;
+
++    const auto profile_invalidate = subdivision_profile::start();
+     if (ob->type == OB_MESH && do_merge_customdata &&
+         ELEM(mti->type, ModifierTypeType::Constructive, ModifierTypeType::Nonconstructive))
+     {
+@@ -2054,6 +2064,9 @@
+     DEG_id_tag_update(&ob->id, ID_RECALC_GEOMETRY);
+     DEG_relations_tag_update(bmain);
+     WM_event_add_notifier(C, NC_OBJECT | ND_MODIFIER, ob);
++    if (mti == BKE_modifier_get_info(eModifierType_Subsurf)) {
++      subdivision_profile::report("apply_merge_uv_and_invalidate", profile_invalidate);
++    }
+   }
+
+   if (!changed) {
+--- a/source/blender/modifiers/intern/MOD_subsurf.cc
++++ b/source/blender/modifiers/intern/MOD_subsurf.cc
+@@ -14,6 +14,7 @@
+ #include "MEM_guardedalloc.h"
+
+ #include "BLI_utildefines.hh"
++#include "BLI_subdivision_profile.hh"
+
+ #include "BLT_translation.hh"
+
+@@ -247,8 +248,10 @@
+     }
+   }
+
++  const auto profile_descriptor = subdivision_profile::start();
+   bke::subdiv::Subdiv *subdiv = BKE_subsurf_modifier_subdiv_descriptor_ensure(
+       runtime_data, mesh, false);
++  subdivision_profile::report("subdiv_modifier_descriptor", profile_descriptor);
+   if (subdiv == nullptr) {
+     /* Happens on bad topology, but also on empty input mesh. */
+     return result;
+--- a/source/blender/blenkernel/intern/subdiv_foreach.cc
++++ b/source/blender/blenkernel/intern/subdiv_foreach.cc
+@@ -12,6 +12,8 @@
+ #include "BKE_customdata.hh"
+ #include "BKE_subdiv.hh"
+ #include "BKE_subdiv_foreach.hh"
++#include "BLI_subdivision_profile.hh"
++#include <atomic>
+ #include "BKE_subdiv_mesh.hh"
+
+ #include "DNA_mesh_types.h"
+@@ -63,6 +65,9 @@
+  * \{ */
+
+ struct ForeachTaskContext {
++  std::atomic<uint64_t> profile_vertices_us{0};
++  std::atomic<uint64_t> profile_edges_us{0};
++  std::atomic<uint64_t> profile_loops_us{0};
+   const Mesh *coarse_mesh;
+   Span<int2> coarse_edges;
+   OffsetIndices<int> coarse_faces;
+@@ -1729,14 +1734,29 @@
+                                 const TaskParallelTLS *__restrict tls)
+ {
+   ForeachTaskContext *ctx = static_cast<ForeachTaskContext *>(userdata);
++  auto profile = subdivision_profile::start();
+   /* Traverse hi-poly vertex coordinates and normals. */
+   subdiv_foreach_vertices(ctx, tls->userdata_chunk, face_index);
++  if (subdivision_profile::enabled()) {
++    ctx->profile_vertices_us.fetch_add(uint64_t(subdivision_profile::elapsed(profile) * 1000.0),
++                                       std::memory_order_relaxed);
++    profile = subdivision_profile::start();
++  }
+   /* Traverse mesh geometry for the given base poly index. */
+   if (ctx->foreach_context->edge != nullptr) {
+     subdiv_foreach_edges(ctx, tls->userdata_chunk, face_index);
+   }
++  if (subdivision_profile::enabled()) {
++    ctx->profile_edges_us.fetch_add(uint64_t(subdivision_profile::elapsed(profile) * 1000.0),
++                                    std::memory_order_relaxed);
++    profile = subdivision_profile::start();
++  }
+   if (ctx->foreach_context->loop != nullptr) {
+     subdiv_foreach_loops(ctx, tls->userdata_chunk, face_index);
++  }
++  if (subdivision_profile::enabled()) {
++    ctx->profile_loops_us.fetch_add(uint64_t(subdivision_profile::elapsed(profile) * 1000.0),
++                                    std::memory_order_relaxed);
+   }
+ }
+
+@@ -1759,7 +1779,8 @@
+                              const ToMeshSettings *mesh_settings,
+                              const Mesh *coarse_mesh)
+ {
+-  ForeachTaskContext ctx = {nullptr};
++  ForeachTaskContext ctx{};
++  const auto profile_prepare = subdivision_profile::start();
+   ctx.coarse_mesh = coarse_mesh;
+   ctx.coarse_edges = coarse_mesh->edges();
+   ctx.coarse_faces = coarse_mesh->faces();
+@@ -1782,8 +1803,11 @@
+       return false;
+     }
+   }
++  subdivision_profile::report("subdiv_topology_layout_and_alloc", profile_prepare);
++  const auto profile_boundary = subdivision_profile::start();
+   /* Run all the code which is not supposed to be run from threads. */
+   subdiv_foreach_single_thread_tasks(&ctx);
++  subdivision_profile::report("subdiv_boundary_vertex_evaluation", profile_boundary);
+   /* Threaded traversal of the rest of topology. */
+   TaskParallelSettings parallel_range_settings;
+   BLI_parallel_range_settings_defaults(&parallel_range_settings);
+@@ -1794,9 +1818,11 @@
+     parallel_range_settings.func_free = subdiv_foreach_free;
+   }
+
++  const auto profile_face_attributes = subdivision_profile::start();
+   if (context->faces) {
+     context->faces(context, OffsetIndices<int>(ctx.subdiv_face_offset));
+   }
++  subdivision_profile::report("subdiv_face_attributes_and_offsets", profile_face_attributes);
+
+   /* TODO(sergey): Possible optimization is to have a single pool and push all
+    * the tasks into it.
+@@ -1804,8 +1830,19 @@
+    * currently are relying on the fact that face/grid callbacks will tag non-
+    * loose geometry. */
+
++  const auto profile_parallel = subdivision_profile::start();
+   BLI_task_parallel_range(
+       0, coarse_mesh->faces_num, &ctx, subdiv_foreach_task, &parallel_range_settings);
++  subdivision_profile::report("subdiv_parallel_wall", profile_parallel);
++  if (subdivision_profile::enabled()) {
++    std::fprintf(stderr,
++                 "SUBDIV_PHASE name=subdiv_position_worker_sum ms=%.3f\n"
++                 "SUBDIV_PHASE name=subdiv_edge_worker_sum ms=%.3f\n"
++                 "SUBDIV_PHASE name=subdiv_corner_uv_and_attributes_worker_sum ms=%.3f\n",
++                 ctx.profile_vertices_us.load(std::memory_order_relaxed) / 1000.0,
++                 ctx.profile_edges_us.load(std::memory_order_relaxed) / 1000.0,
++                 ctx.profile_loops_us.load(std::memory_order_relaxed) / 1000.0);
++  }
+   if (context->vert_loose != nullptr) {
+     BLI_task_parallel_range(0,
+                             coarse_mesh->verts_num,
+--- a/source/blender/blenkernel/intern/subdiv_mesh.cc
++++ b/source/blender/blenkernel/intern/subdiv_mesh.cc
+@@ -9,6 +9,8 @@
+ #include <cstddef>
+ #include <cstdio>
+ #include <cstdlib>
++
++#include "BLI_subdivision_profile.hh"
+
+ #include "DNA_key_types.h"
+ #include "DNA_mesh_types.h"
+@@ -1511,6 +1513,7 @@
+
+ Mesh *subdiv_to_mesh(Subdiv *subdiv, const ToMeshSettings *settings, const Mesh *coarse_mesh)
+ {
++  const auto profile_begin = subdivision_profile::start();
+
+   stats_begin(&subdiv->stats, SUBDIV_STATS_SUBDIV_TO_MESH);
+   /* Make sure evaluator is up to date with possible new topology, and that
+@@ -1525,6 +1528,14 @@
+       return nullptr;
+     }
+   }
++  subdivision_profile::report("subdiv_evaluator_upload_and_refine", profile_begin);
++  if (subdivision_profile::enabled()) {
++    std::fprintf(stderr,
++                 "SUBDIV_PHASE name=osd_evaluator_create ms=%.6f\n"
++                 "SUBDIV_PHASE name=osd_cpu_stencil_refine ms=%.6f\n",
++                 subdiv->stats.evaluator_creation_time * 1000.0,
++                 subdiv->stats.evaluator_refine_time * 1000.0);
++  }
+   /* Initialize subdivision mesh creation context. */
+   SubdivMeshContext subdiv_context{};
+   subdiv_context.settings = settings;
+@@ -1552,7 +1563,10 @@
+   foreach_context.user_data = &subdiv_context;
+   foreach_context.user_data_tls_size = sizeof(SubdivMeshTLS);
+   foreach_context.user_data_tls = &tls;
++  const auto profile_traversal = subdivision_profile::start();
+   foreach_subdiv_geometry(subdiv, &foreach_context, settings, coarse_mesh);
++  subdivision_profile::report("subdiv_mesh_traversal", profile_traversal);
++  const auto profile_finish = subdivision_profile::start();
+   stats_end(&subdiv->stats, SUBDIV_STATS_SUBDIV_TO_MESH_GEOMETRY);
+   Mesh *result = subdiv_context.subdiv_mesh;
+
+@@ -1609,5 +1623,7 @@
+
+   stats_end(&subdiv->stats, SUBDIV_STATS_SUBDIV_TO_MESH);
+   subdiv_mesh_context_free(&subdiv_context);
++  subdivision_profile::report("subdiv_finish_attributes_and_runtime", profile_finish);
++  subdivision_profile::report("subdiv_to_mesh_total", profile_begin);
+   return result;
+ }

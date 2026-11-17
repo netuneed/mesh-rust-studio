@@ -1,0 +1,79 @@
+diff --git a/source/blender/editors/uvedit/uvedit_unwrap_ops.cc b/source/blender/editors/uvedit/uvedit_unwrap_ops.cc
+--- a/source/blender/editors/uvedit/uvedit_unwrap_ops.cc
++++ b/source/blender/editors/uvedit/uvedit_unwrap_ops.cc
+@@ -29,6 +29,7 @@
+ #include "BLI_memarena.hh"
+ #include "BLI_rect.hh"
+ #include "BLI_string_utf8.hh"
++#include "BLI_subdivision_profile.hh"
+ #include "BLI_time.hh"
+ #include "BLI_utildefines.hh"
+ #include "BLI_vector.hh"
+@@ -3157,6 +3158,8 @@
+
+   Vector<const ThickFace *> project_thick_faces;
+   Vector<float3> project_normal_array;
++  /* For each remaining face, keep its maximum dot over the accepted projection normals. */
++  Array<float> max_projection_dots(thick_faces_len, -1.0f);
+
+   BM_mesh_elem_hflag_disable_all(bm, BM_FACE, BM_ELEM_TAG, false);
+
+@@ -3195,7 +3198,8 @@
+     }
+
+     /* Avoid NAN. */
+-    if (normalize_v3(average_normal) != 0.0f) {
++    const bool accepted_normal = normalize_v3(average_normal) != 0.0f;
++    if (accepted_normal) {
+       project_normal_array.append(average_normal);
+     }
+
+@@ -3208,14 +3212,13 @@
+         continue;
+       }
+
+-      float angle_test = -1.0f;
+-      for (int p_index = 0; p_index < project_normal_array.size(); p_index++) {
+-        angle_test = max_ff(angle_test,
+-                            dot_v3v3(project_normal_array[p_index], thick_faces[f_index].efa->no));
+-      }
+-
+-      if (angle_test < anble_best) {
+-        anble_best = angle_test;
++      float &max_dot = max_projection_dots[f_index];
++      if (accepted_normal) {
++        max_dot = max_ff(max_dot, dot_v3v3(average_normal, thick_faces[f_index].efa->no));
++      }
++
++      if (max_dot < anble_best) {
++        anble_best = max_dot;
+         angle_best_index = f_index;
+       }
+     }
+@@ -3321,6 +3324,7 @@
+       thick_faces_len -= 1;
+     }
+
++    const auto normals_begin = subdivision_profile::start();
+     Vector<float3> project_normal_array = smart_uv_project_calculate_project_normals(
+         thick_faces,
+         thick_faces_len,
+@@ -3328,6 +3332,7 @@
+         project_angle_limit_half_cos,
+         project_angle_limit_cos,
+         area_weight);
++    subdivision_profile::report("smart_uv_projection_normals", normals_begin);
+
+     if (project_normal_array.is_empty()) {
+       MEM_delete(thick_faces);
+@@ -3407,8 +3412,10 @@
+     params.margin_method = eUVPackIsland_MarginMethod(RNA_enum_get(op->ptr, "margin_method"));
+     params.margin = RNA_float_get(op->ptr, "island_margin");
+
++    const auto pack_begin = subdivision_profile::start();
+     uvedit_pack_islands_multi(
+         scene, objects_changed, nullptr, nullptr, false, true, nullptr, &params);
++    subdivision_profile::report("smart_uv_pack_islands", pack_begin);
+
+     /* #uvedit_pack_islands_multi only supports `per_face_aspect = false`. */
+     const bool per_face_aspect = false;

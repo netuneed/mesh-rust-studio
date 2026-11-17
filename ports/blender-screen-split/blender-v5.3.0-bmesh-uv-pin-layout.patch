@@ -1,0 +1,14 @@
+diff --git a/source/blender/bmesh/intern/bmesh_mesh_convert.cc b/source/blender/bmesh/intern/bmesh_mesh_convert.cc
+--- a/source/blender/bmesh/intern/bmesh_mesh_convert.cc
++++ b/source/blender/bmesh/intern/bmesh_mesh_convert.cc
+@@ -389,8 +389,8 @@
+       const StringRef name = BKE_uv_map_pin_name_get(
+           CustomData_get_layer_name(&mesh_ldata, CD_PROP_FLOAT2, layer_index), buffer);
+       if (CustomData_get_named_layer_index(&mesh_ldata, CD_PROP_BOOL, name) < 0) {
+-        CustomData_add_layer_named(
+-            &mesh_ldata, CD_PROP_BOOL, CD_SET_DEFAULT, mesh->corners_num, name);
++        /* Only the layer layout is copied. Missing values are initialized in BMesh blocks. */
++        CustomData_add_layer_named(&mesh_ldata, CD_PROP_BOOL, CD_SET_DEFAULT, 0, name);
+         temporary_layers_to_delete.append(std::string(name));
+       }
+     }

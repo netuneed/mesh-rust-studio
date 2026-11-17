@@ -1,0 +1,78 @@
+diff --git a/source/blender/bmesh/intern/bmesh_mesh_convert.cc b/source/blender/bmesh/intern/bmesh_mesh_convert.cc
+--- a/source/blender/bmesh/intern/bmesh_mesh_convert.cc
++++ b/source/blender/bmesh/intern/bmesh_mesh_convert.cc
+@@ -1422,9 +1422,24 @@
+   for (const int i : pin_layers.index_range()) {
+     pin_offsets[i] = ldata.layers[pin_layers[i]].offset;
+   }
+
+-  Array<bool> need_pin(pin_layers.size(), false);
++  static const bool serial_loops = std::getenv("BLENDER_RUST_SERIAL_BMESH_LOOPS") != nullptr;
++  const bool parallel_loops = !serial_loops && bm.totloop >= 131072 && bm.totface >= 1024;
++  Array<int> loop_starts(parallel_loops ? face_table.size() : 0);
++  Array<bool, 8> need_pin(pin_layers.size(), false);
++  const auto build_face_loops = [&](const BMFace *face, int loop_i, MutableSpan<bool> found_pin) {
++    BMLoop *loop = BM_FACE_FIRST_LOOP(face);
++    for ([[maybe_unused]] const int i : IndexRange(face->len)) {
++      BM_elem_index_set(loop, loop_i); /* set_inline */
++      loop_table[loop_i] = loop;
++      for (const int i : pin_offsets.index_range()) {
++        found_pin[i] = found_pin[i] || BM_ELEM_CD_GET_BOOL(loop, pin_offsets[i]);
++      }
++      loop = loop->next;
++      loop_i++;
++    }
++  };
+   char hflag = 0;
+   BMIter iter;
+   int face_i = 0;
+   int loop_i = 0;
+@@ -1435,21 +1450,36 @@
+     hflag |= face->head.hflag;
+     need_sharp_face |= (face->head.hflag & BM_ELEM_SMOOTH) == 0;
+     need_material_index |= face->mat_nr != 0;
+
+-    BMLoop *loop = BM_FACE_FIRST_LOOP(face);
+-    for ([[maybe_unused]] const int i : IndexRange(face->len)) {
+-      BM_elem_index_set(loop, loop_i); /* set_inline */
+-      loop_table[loop_i] = loop;
+-      for (const int i : pin_offsets.index_range()) {
+-        if (BM_ELEM_CD_GET_BOOL(loop, pin_offsets[i])) {
+-          need_pin[i] = true;
+-        }
+-      }
+-      loop = loop->next;
+-      loop_i++;
+-    }
++    if (parallel_loops) {
++      loop_starts[face_i] = loop_i;
++    }
++    else {
++      build_face_loops(face, loop_i, need_pin);
++    }
++    loop_i += face->len;
++  }
++  if (parallel_loops) {
++    /* Preserve BMesh face order and give each worker a disjoint range of corners. */
++    need_pin = threading::parallel_reduce(
++        face_table.index_range(),
++        512,
++        need_pin,
++        [&](const IndexRange range, const Array<bool, 8> &initial) {
++          Array<bool, 8> pins = initial;
++          for (const int face_i : range) {
++            build_face_loops(face_table[face_i], loop_starts[face_i], pins);
++          }
++          return pins;
++        },
++        [](Array<bool, 8> left, const Array<bool, 8> &right) {
++          for (const int i : left.index_range()) {
++            left[i] = left[i] || right[i];
++          }
++          return left;
++        });
+   }
+   need_select_poly = (hflag & BM_ELEM_SELECT) != 0;
+   need_hide_poly = (hflag & BM_ELEM_HIDDEN) != 0;
+
+   for (const int i : pin_layers.index_range()) {

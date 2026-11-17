@@ -1,0 +1,66 @@
+diff --git a/source/blender/draw/intern/draw_context.cc b/source/blender/draw/intern/draw_context.cc
+index 8416fc0..f3daa33 100644
+--- a/source/blender/draw/intern/draw_context.cc
++++ b/source/blender/draw/intern/draw_context.cc
+@@ -6,8 +6,9 @@
+  * \ingroup draw
+  */
+
+ #include <cstdio>
++#include <cstdlib>
+
+ #include "CLG_log.h"
+
+ #include "BLI_enum_flags.hh"
+@@ -1230,8 +1231,16 @@ void DRWContext::sync(iter_callback_t iter_callback)
+ void DRWContext::engines_init_and_sync(iter_callback_t iter_callback)
+ {
+   double start_time = BLI_time_now_seconds();
+
++  static const bool serial_viewport_startup =
++      std::getenv("BLENDER_RUST_SERIAL_VIEWPORT_STARTUP") != nullptr;
++  if (!serial_viewport_startup && mode == VIEWPORT && v3d != nullptr && rv3d != nullptr &&
++      v3d->shading.type == OB_SOLID && GPU_backend_get_type() == GPU_BACKEND_VULKAN) {
++    /* Start the common draw shaders before engines queue their own variants. */
++    DRW_shader_viewport_compile_async();
++  }
++
+   view_data_active->foreach_enabled_engine([&](DrawEngine &instance) { instance.init(); });
+
+   view_data_active->manager->begin_sync(this->obact);
+
+diff --git a/source/blender/draw/intern/draw_shader.cc b/source/blender/draw/intern/draw_shader.cc
+index 9da533e..ac1fcd1 100644
+--- a/source/blender/draw/intern/draw_shader.cc
++++ b/source/blender/draw/intern/draw_shader.cc
+@@ -215,8 +215,16 @@ gpu::Shader *DRW_shader_debug_draw_display_get()
+ {
+   return ShaderCache::get().debug_draw_display.get();
+ }
+
++void DRW_shader_viewport_compile_async()
++{
++  ShaderCache &cache = ShaderCache::get();
++  cache.draw_resource_finalize.ensure_compile_async();
++  cache.draw_visibility_compute.ensure_compile_async();
++  cache.draw_command_generate.ensure_compile_async();
++}
++
+ gpu::Shader *DRW_shader_draw_visibility_compute_get()
+ {
+   return ShaderCache::get().draw_visibility_compute.get();
+ }
+diff --git a/source/blender/draw/intern/draw_shader.hh b/source/blender/draw/intern/draw_shader.hh
+index 70899b2..9eabea9 100644
+--- a/source/blender/draw/intern/draw_shader.hh
++++ b/source/blender/draw/intern/draw_shader.hh
+@@ -25,8 +25,9 @@ gpu::Shader *DRW_shader_curves_refine_get(draw::CurvesEvalShader type);
+
+ gpu::Shader *DRW_shader_gsplat_compute_get(draw::GSplatEvalShader type);
+
+ gpu::Shader *DRW_shader_debug_draw_display_get();
++void DRW_shader_viewport_compile_async();
+ gpu::Shader *DRW_shader_draw_visibility_compute_get();
+ gpu::Shader *DRW_shader_draw_view_finalize_get();
+ gpu::Shader *DRW_shader_draw_resource_finalize_get();
+ gpu::Shader *DRW_shader_draw_command_generate_get();

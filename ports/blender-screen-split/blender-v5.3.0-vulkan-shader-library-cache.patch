@@ -1,0 +1,194 @@
+diff --git a/source/blender/gpu/vulkan/vk_pipeline_pool.cc b/source/blender/gpu/vulkan/vk_pipeline_pool.cc
+index 59a92c21..c6fd5d6a 100644
+--- a/source/blender/gpu/vulkan/vk_pipeline_pool.cc
++++ b/source/blender/gpu/vulkan/vk_pipeline_pool.cc
+@@ -6,6 +6,7 @@
+  * \ingroup gpu
+  */
+
++#include <limits>
+ #include <sstream>
+
+ #include "BKE_appdir.hh"
+@@ -13,7 +14,9 @@
+
+ #include "BLI_fileops.hh"
+ #include "BLI_path_utils.hh"
++#include "BLI_system.hh"
+ #include "BLI_time.hh"
++#include BLI_SYSTEM_PID_H
+
+ #include "CLG_log.h"
+
+@@ -178,7 +181,8 @@ static VkPipeline create_graphics_pipeline_libs(const VKGraphicsInfo &graphics_i
+
+   VkPipeline vertex_input_lib = device.pipelines.get_or_create_vertex_input_lib(
+       graphics_info.vertex_in);
+-  VkPipeline shaders_lib = device.pipelines.get_or_create_shaders_lib(graphics_info.shaders);
++  VkPipeline shaders_lib = device.pipelines.get_or_create_shaders_lib(graphics_info.shaders,
++                                                                     vk_pipeline_cache);
+   VkPipeline fragment_output_lib = device.pipelines.get_or_create_fragment_output_lib(
+       graphics_info.fragment_out);
+
+@@ -526,11 +530,12 @@ VkPipeline VKPipelineMap<VKGraphicsInfo::VertexIn>::create(
+ /** \name Shaders library
+  * \{ */
+
+-VkPipeline VKPipelinePool::get_or_create_shaders_lib(const VKGraphicsInfo::Shaders &shaders_info)
++VkPipeline VKPipelinePool::get_or_create_shaders_lib(const VKGraphicsInfo::Shaders &shaders_info,
++                                                    VkPipelineCache vk_pipeline_cache)
+ {
+   bool created = false;
+   return shaders_libs_.get_or_create(
+-      shaders_info, vk_pipeline_cache_non_static_, VK_NULL_HANDLE, "ShadersLib", created);
++      shaders_info, vk_pipeline_cache, VK_NULL_HANDLE, "ShadersLib", created);
+ }
+
+ template<>
+@@ -660,7 +665,7 @@ struct VKPipelineCachePrefixHeader {
+
+ static std::string pipeline_cache_filepath_get()
+ {
+-  static char tmp_dir_buffer[1024];
++  char tmp_dir_buffer[1024];
+   BKE_appdir_folder_caches(tmp_dir_buffer, sizeof(tmp_dir_buffer));
+
+   std::string cache_dir = std::string(tmp_dir_buffer) + "vk-pipeline-cache" + SEP_STR;
+@@ -684,20 +689,21 @@ void VKPipelinePool::read_from_disk()
+     return;
+   }
+
+-  /* Prevent old cache files from being deleted if they're still being used. */
+-  BLI_file_touch(cache_file.c_str());
+-  /* Read cached binary. */
+   fstream file(cache_file, std::ios::binary | std::ios::in | std::ios::ate);
+-  std::streamsize data_size = file.tellg();
+-  file.seekg(0, std::ios::beg);
+-  Vector<char> buffer(data_size);
+-  file.read(buffer.data(), data_size);
+-  file.close();
++  const std::streamoff file_size = file.tellg();
++  const std::streamoff prefix_size = sizeof(VKPipelineCachePrefixHeader);
++  if (file_size < prefix_size + std::streamoff(sizeof(VkPipelineCacheHeaderVersionOne))) {
++    return;
++  }
+
+-  /* Validate the prefix header. */
++  file.seekg(0, std::ios::beg);
++  VKPipelineCachePrefixHeader read_prefix;
++  if (!file.read(reinterpret_cast<char *>(&read_prefix), sizeof(read_prefix)) ||
++      read_prefix.data_size != file_size - prefix_size)
++  {
++    return;
++  }
+   VKPipelineCachePrefixHeader prefix;
+-  VKPipelineCachePrefixHeader &read_prefix = *reinterpret_cast<VKPipelineCachePrefixHeader *>(
+-      buffer.data());
+   prefix.data_size = read_prefix.data_size;
+   if (memcmp(&read_prefix, &prefix, sizeof(VKPipelineCachePrefixHeader)) != 0) {
+     /* Headers are different, most likely the cache will not work and potentially crash the driver.
+@@ -710,18 +716,38 @@ void VKPipelinePool::read_from_disk()
+     return;
+   }
+
+-  CLOG_INFO(&LOG, "Initialize static pipeline cache from disk [%s].", cache_file.c_str());
++  VkPipelineCacheHeaderVersionOne driver_header;
++  if (!file.read(reinterpret_cast<char *>(&driver_header), sizeof(driver_header)) ||
++      driver_header.headerSize != sizeof(driver_header) ||
++      driver_header.headerVersion != VK_PIPELINE_CACHE_HEADER_VERSION_ONE ||
++      driver_header.vendorID != prefix.vendor_id || driver_header.deviceID != prefix.device_id ||
++      memcmp(driver_header.pipelineCacheUUID, prefix.pipeline_cache_uuid, VK_UUID_SIZE) != 0)
++  {
++    return;
++  }
++  Vector<char> buffer(read_prefix.data_size);
++  memcpy(buffer.data(), &driver_header, sizeof(driver_header));
++  if (!file.read(buffer.data() + sizeof(driver_header), buffer.size() - sizeof(driver_header))) {
++    return;
++  }
++  file.close();
++
+   VKDevice &device = VKBackend::get().device;
+   VkPipelineCacheCreateInfo create_info = {};
+   create_info.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
+   create_info.initialDataSize = read_prefix.data_size;
+-  create_info.pInitialData = buffer.data() + sizeof(VKPipelineCachePrefixHeader);
++  create_info.pInitialData = buffer.data();
+   VkPipelineCache vk_pipeline_cache = VK_NULL_HANDLE;
+-  device.functions.vkCreatePipelineCache(
+-      device.vk_handle(), &create_info, nullptr, &vk_pipeline_cache);
+-
+-  device.functions.vkMergePipelineCaches(
+-      device.vk_handle(), vk_pipeline_cache_static_, 1, &vk_pipeline_cache);
++  if (device.functions.vkCreatePipelineCache(
++          device.vk_handle(), &create_info, nullptr, &vk_pipeline_cache) != VK_SUCCESS)
++  {
++    return;
++  }
++  if (device.functions.vkMergePipelineCaches(
++          device.vk_handle(), vk_pipeline_cache_static_, 1, &vk_pipeline_cache) == VK_SUCCESS)
++  {
++    CLOG_INFO(&LOG, "Initialize static pipeline cache from disk [%s].", cache_file.c_str());
++  }
+   device.functions.vkDestroyPipelineCache(device.vk_handle(), vk_pipeline_cache, nullptr);
+ #endif
+ }
+@@ -737,21 +763,37 @@ void VKPipelinePool::write_to_disk()
+
+   VKDevice &device = VKBackend::get().device;
+   size_t data_size;
+-  device.functions.vkGetPipelineCacheData(
+-      device.vk_handle(), vk_pipeline_cache_static_, &data_size, nullptr);
++  if (device.functions.vkGetPipelineCacheData(
++          device.vk_handle(), vk_pipeline_cache_static_, &data_size, nullptr) != VK_SUCCESS ||
++      data_size < sizeof(VkPipelineCacheHeaderVersionOne) ||
++      data_size > std::numeric_limits<uint32_t>::max())
++  {
++    return;
++  }
+   Vector<char> buffer(data_size);
+-  device.functions.vkGetPipelineCacheData(
+-      device.vk_handle(), vk_pipeline_cache_static_, &data_size, buffer.data());
++  if (device.functions.vkGetPipelineCacheData(
++          device.vk_handle(), vk_pipeline_cache_static_, &data_size, buffer.data()) != VK_SUCCESS)
++  {
++    return;
++  }
+
+   std::string cache_file = pipeline_cache_filepath_get();
+-  CLOG_INFO(&LOG, "Writing static pipeline cache to disk [%s].", cache_file.c_str());
+-
+-  fstream file(cache_file, std::ios::binary | std::ios::out);
++  /* Keep the previous cache readable until the new data has been written and closed. */
++  const std::string temporary = cache_file + "." + std::to_string(getpid()) + ".tmp";
++  fstream file(temporary, std::ios::binary | std::ios::out);
+
+   VKPipelineCachePrefixHeader header;
+   header.data_size = data_size;
+   file.write(reinterpret_cast<char *>(&header), sizeof(VKPipelineCachePrefixHeader));
+   file.write(buffer.data(), data_size);
++  file.close();
++  if (!file || BLI_is_dir(cache_file.c_str()) ||
++      BLI_rename_overwrite(temporary.c_str(), cache_file.c_str()) != 0)
++  {
++    BLI_delete(temporary.c_str(), false, false);
++    return;
++  }
++  CLOG_INFO(&LOG, "Writing static pipeline cache to disk [%s].", cache_file.c_str());
+ #endif
+ }
+
+diff --git a/source/blender/gpu/vulkan/vk_pipeline_pool.hh b/source/blender/gpu/vulkan/vk_pipeline_pool.hh
+index 057011a3..64ac2187 100644
+--- a/source/blender/gpu/vulkan/vk_pipeline_pool.hh
++++ b/source/blender/gpu/vulkan/vk_pipeline_pool.hh
+@@ -454,7 +454,8 @@ class VKPipelinePool : public NonCopyable {
+    * \param shaders_info: Description of the pipeline to compile.
+    * \returns The handle of the compiled pipeline.
+    */
+-  VkPipeline get_or_create_shaders_lib(const VKGraphicsInfo::Shaders &shaders_info);
++  VkPipeline get_or_create_shaders_lib(const VKGraphicsInfo::Shaders &shaders_info,
++                                       VkPipelineCache vk_pipeline_cache);
+
+   /**
+    * Get an existing or create a new fragment output library pipeline based on the provided info.

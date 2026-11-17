@@ -1,0 +1,138 @@
+diff --git a/source/blender/editors/transform/CMakeLists.txt b/source/blender/editors/transform/CMakeLists.txt
+index 3544b42..c88edb2 100644
+--- a/source/blender/editors/transform/CMakeLists.txt
++++ b/source/blender/editors/transform/CMakeLists.txt
+@@ -129,5 +129,16 @@ set(LIB
+
+ blender_add_lib(bf_editor_transform "${SRC}" "${INC}" "${INC_SYS}" "${LIB}")
+
++option(WITH_BLENDER_RUST_EDIT_MESH "Use Rust for ordinary Edit Mesh translation" OFF)
++if(WITH_BLENDER_RUST_EDIT_MESH)
++  if(NOT BLENDER_RUST_SCREEN_SPLIT_LIB OR NOT EXISTS "${BLENDER_RUST_SCREEN_SPLIT_LIB}")
++    message(FATAL_ERROR "WITH_BLENDER_RUST_EDIT_MESH requires the Rust port static library")
++  endif()
++  set_property(SOURCE transform_mode_translate.cc APPEND PROPERTY
++    COMPILE_DEFINITIONS WITH_BLENDER_RUST_EDIT_MESH
++  )
++  target_link_libraries(bf_editor_transform PRIVATE "${BLENDER_RUST_SCREEN_SPLIT_LIB}")
++endif()
++
+ # RNA_prototypes.hh
+ add_dependencies(bf_editor_transform bf_rna)
+diff --git a/source/blender/editors/transform/transform_mode_translate.cc b/source/blender/editors/transform/transform_mode_translate.cc
+index 6634611..9a435e9 100644
+--- a/source/blender/editors/transform/transform_mode_translate.cc
++++ b/source/blender/editors/transform/transform_mode_translate.cc
+@@ -6,6 +6,8 @@
+  * \ingroup edtransform
+  */
+
++#include <cstddef>
++#include <cstdint>
+ #include <cstdlib>
+
+ #include "MEM_guardedalloc.h"
+@@ -67,13 +69,44 @@ struct TranslateCustomData {
+ /** \name Transform (Translation) Element
+  * \{ */
+
++#ifdef WITH_BLENDER_RUST_EDIT_MESH
++/* Value ABI shared with the Rust edit_mesh module. */
++struct RustEditMeshVector {
++  float values[3];
++};
++
++struct RustEditMeshInverse {
++  float columns[3][3];
++};
++
++static_assert(sizeof(float) == 4 && alignof(float) == 4);
++static_assert(sizeof(RustEditMeshVector) == 12 && alignof(RustEditMeshVector) == 4);
++static_assert(offsetof(RustEditMeshVector, values) == 0);
++static_assert(sizeof(RustEditMeshInverse) == 36 && alignof(RustEditMeshInverse) == 4);
++static_assert(offsetof(RustEditMeshInverse, columns) == 0);
++
++extern "C" RustEditMeshVector blender_edit_mesh_translate_vertex(RustEditMeshVector original,
++                                                                 RustEditMeshVector displacement,
++                                                                 RustEditMeshInverse inverse,
++                                                                 float factor,
++                                                                 uint8_t trace);
++
++static bool is_ordinary_mesh_vertex(const TransData &td)
++{
++  return (td.flag & (TD_SELECTED | TD_SKIP)) == TD_SELECTED && td.loc && !td.protectflag &&
++         !td.con;
++}
++#endif
++
+ static void transdata_elem_translate(const TransInfo *t,
+                                      const TransDataContainer *tc,
+                                      TransData *td,
+                                      TransDataExtension *td_ext,
+                                      const float3 &snap_source_local,
+                                      const float3 &vec,
+-                                     enum eTranslateRotateMode rotate_mode)
++                                     enum eTranslateRotateMode rotate_mode,
++                                     [[maybe_unused]] const bool use_rust,
++                                     [[maybe_unused]] const bool trace_rust)
+ {
+   float rotate_offset[3] = {0};
+   bool use_rotate_offset = false;
+@@ -124,6 +157,19 @@ static void transdata_elem_translate(const TransInfo *t,
+     copy_v3_v3(tvec, vec);
+   }
+
++#ifdef WITH_BLENDER_RUST_EDIT_MESH
++  if (use_rust && is_ordinary_mesh_vertex(*td)) {
++    const RustEditMeshVector original = {{td->iloc[0], td->iloc[1], td->iloc[2]}};
++    const RustEditMeshVector displacement = {{tvec[0], tvec[1], tvec[2]}};
++    RustEditMeshInverse inverse;
++    copy_m3_m3(inverse.columns, td->smtx);
++    const RustEditMeshVector result = blender_edit_mesh_translate_vertex(
++        original, displacement, inverse, td->factor, uint8_t(trace_rust));
++    copy_v3_v3(td->loc, result.values);
++    return;
++  }
++#endif
++
+   mul_m3_v3(td->smtx, tvec);
+
+   if (use_rotate_offset) {
+@@ -438,6 +484,21 @@ static void applyTranslationValue(TransInfo *t, const float vec[3])
+       }
+     }
+
++#ifdef WITH_BLENDER_RUST_EDIT_MESH
++    const bool use_rust = t->data_type == &TransConvertType_Mesh && !(t->flag & T_PROP_EDIT) &&
++                          !tc->use_mirror_axis_any && rotate_mode == TRANSLATE_ROTATE_OFF;
++    const TransData *trace_td = nullptr;
++    if (use_rust) {
++      for (int i = 0; i < tc->data_len; i++) {
++        const TransData *candidate = &tc->data[i];
++        if (is_ordinary_mesh_vertex(*candidate)) {
++          trace_td = candidate;
++          break;
++        }
++      }
++    }
++#endif
++
+     threading::parallel_for(IndexRange(tc->data_len), 1024, [&](const IndexRange range) {
+       for (const int i : range) {
+         TransData *td = &tc->data[i];
+@@ -445,7 +506,14 @@ static void applyTranslationValue(TransInfo *t, const float vec[3])
+         if (td->flag & TD_SKIP) {
+           continue;
+         }
+-        transdata_elem_translate(t, tc, td, td_ext, snap_source_local, vec, rotate_mode);
++#ifdef WITH_BLENDER_RUST_EDIT_MESH
++        const bool trace_rust = td == trace_td;
++#else
++        constexpr bool use_rust = false;
++        constexpr bool trace_rust = false;
++#endif
++        transdata_elem_translate(
++            t, tc, td, td_ext, snap_source_local, vec, rotate_mode, use_rust, trace_rust);
+       }
+     });
+   }

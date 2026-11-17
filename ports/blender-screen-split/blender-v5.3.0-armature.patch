@@ -1,0 +1,146 @@
+diff --git a/source/blender/blenkernel/CMakeLists.txt b/source/blender/blenkernel/CMakeLists.txt
+index aa7fa9d..3323a3a 100644
+--- a/source/blender/blenkernel/CMakeLists.txt
++++ b/source/blender/blenkernel/CMakeLists.txt
+@@ -767,6 +767,12 @@ endif()
+ blender_add_lib(bf_blenkernel "${SRC}" "${INC}" "${INC_SYS}" "${LIB}")
+ add_library(bf::blenkernel ALIAS bf_blenkernel)
+
++if(BLENDER_RUST_SCREEN_SPLIT_LIB)
++  set_property(SOURCE intern/armature_deform.cc APPEND PROPERTY COMPILE_DEFINITIONS
++    WITH_BLENDER_RUST_ARMATURE)
++  target_link_libraries(bf_blenkernel PRIVATE "${BLENDER_RUST_SCREEN_SPLIT_LIB}")
++endif()
++
+ # RNA_prototypes.hh
+ add_dependencies(bf_blenkernel bf_rna)
+
+diff --git a/source/blender/blenkernel/intern/armature_deform.cc b/source/blender/blenkernel/intern/armature_deform.cc
+index c34ae0a..5f3dfc9 100644
+--- a/source/blender/blenkernel/intern/armature_deform.cc
++++ b/source/blender/blenkernel/intern/armature_deform.cc
+@@ -44,10 +44,42 @@
+
+ #include "CLG_log.h"
+
++#ifdef WITH_BLENDER_RUST_ARMATURE
++#  include "BLI_string.hh"
++#  include <atomic>
++#  include <cstddef>
++#  include <cstdio>
++#  include <type_traits>
++#endif
++
+ namespace blender {
+
+ static CLG_LogRef LOG = {"geom.armature_deform"};
+
++#ifdef WITH_BLENDER_RUST_ARMATURE
++/* Keep these value types in sync with ports/blender-screen-split/deform.rs. */
++struct ArmatureDualQuaternion {
++  float rotation[4];
++  float translation[4];
++};
++
++struct ArmaturePoint {
++  float x, y, z;
++};
++
++static_assert(sizeof(ArmatureDualQuaternion) == 32 && alignof(ArmatureDualQuaternion) == 4);
++static_assert(offsetof(ArmatureDualQuaternion, rotation) == 0);
++static_assert(offsetof(ArmatureDualQuaternion, translation) == 16);
++static_assert(sizeof(ArmaturePoint) == 12 && alignof(ArmaturePoint) == 4);
++static_assert(offsetof(ArmaturePoint, x) == 0 && offsetof(ArmaturePoint, y) == 4 &&
++              offsetof(ArmaturePoint, z) == 8);
++
++extern "C" ArmaturePoint blender_rust_armature_dq_delta(ArmatureDualQuaternion dq,
++                                                        ArmaturePoint co,
++                                                        float total,
++                                                        float armature_weight);
++#endif
++
+ /* -------------------------------------------------------------------- */
+ /** \name Armature Deform Internal Utilities
+  * \{ */
+@@ -298,6 +330,11 @@ struct ArmatureDeformParams {
+
+   float4x4 target_to_armature;
+   float4x4 armature_to_target;
++
++#ifdef WITH_BLENDER_RUST_ARMATURE
++  bool use_rust_dq = false;
++  std::atomic<int64_t> *rust_dq_count = nullptr;
++#endif
+ };
+
+ static ArmatureDeformParams get_armature_deform_params(
+@@ -448,7 +485,29 @@ static void armature_vert_task_with_mixer(const ArmatureDeformParams &params,
+   if (contrib > contrib_threshold) {
+     float3 delta_co;
+     float3x3 local_deform_mat;
+-    mixer.finalize(co, contrib, armature_weight, delta_co, local_deform_mat);
++#ifdef WITH_BLENDER_RUST_ARMATURE
++    bool finalized_in_rust = false;
++    if constexpr (std::is_same_v<MixerT, BoneDeformDualQuaternionMixer<false>>) {
++      if (params.use_rust_dq && mixer.dq.scale_weight == 0.0f && std::isfinite(contrib)) {
++        const DualQuat &dq = mixer.dq;
++        const ArmatureDualQuaternion rotation_and_translation = {
++            {dq.quat[0], dq.quat[1], dq.quat[2], dq.quat[3]},
++            {dq.trans[0], dq.trans[1], dq.trans[2], dq.trans[3]},
++        };
++        const ArmaturePoint delta = blender_rust_armature_dq_delta(
++            rotation_and_translation, {co.x, co.y, co.z}, contrib, armature_weight);
++        delta_co = float3(delta.x, delta.y, delta.z);
++        if (params.rust_dq_count) {
++          params.rust_dq_count->fetch_add(1, std::memory_order_relaxed);
++        }
++        finalized_in_rust = true;
++      }
++    }
++    if (!finalized_in_rust)
++#endif
++    {
++      mixer.finalize(co, contrib, armature_weight, delta_co, local_deform_mat);
++    }
+
+     co += delta_co;
+     if (full_deform) {
+@@ -522,6 +581,20 @@ static void armature_deform_coords(const Object &ob_arm,
+                                                                   dverts.has_value());
+
+   const bool use_quaternion = bool(deformflag & ARM_DEF_QUATERNION);
++#ifdef WITH_BLENDER_RUST_ARMATURE
++  deform_params.use_rust_dq = use_quaternion && ob_target.type == OB_MESH && me_target &&
++                              deform_params.use_dverts && !deform_params.use_envelope &&
++                              deform_params.armature_def_nr == -1 && !vert_deform_mats &&
++                              !vert_coords_prev;
++  static const bool trace_rust = [] {
++    const char *value = std::getenv("BLENDER_RUST_ARMATURE_TRACE");
++    return value && std::strcmp(value, "1") == 0;
++  }();
++  std::atomic<int64_t> rust_dq_count = 0;
++  if (deform_params.use_rust_dq && trace_rust) {
++    deform_params.rust_dq_count = &rust_dq_count;
++  }
++#endif
+   constexpr int grain_size = 32;
+   threading::parallel_for(vert_coords.index_range(), grain_size, [&](const IndexRange range) {
+     for (const int i : range) {
+@@ -541,6 +614,17 @@ static void armature_deform_coords(const Object &ob_arm,
+       armature_vert_task_with_dvert(deform_params, i, dvert, use_quaternion);
+     }
+   });
++#ifdef WITH_BLENDER_RUST_ARMATURE
++  if (deform_params.rust_dq_count) {
++    const int64_t count = rust_dq_count.load(std::memory_order_relaxed);
++    if (count != 0) {
++      char escaped_name[2 * sizeof(ob_target.id.name)];
++      BLI_str_escape(escaped_name, ob_target.id.name + 2, sizeof(escaped_name));
++      std::fprintf(
++          stderr, "RUST_ARMATURE_DQ object=%s vertices=%lld\n", escaped_name, (long long)count);
++    }
++  }
++#endif
+ }
+
+ struct ArmatureEditMeshUserdata {

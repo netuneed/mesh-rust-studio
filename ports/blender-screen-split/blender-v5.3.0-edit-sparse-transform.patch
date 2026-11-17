@@ -1,0 +1,40 @@
+diff --git a/source/blender/editors/transform/transform_convert_mesh.cc b/source/blender/editors/transform/transform_convert_mesh.cc
+--- a/source/blender/editors/transform/transform_convert_mesh.cc
++++ b/source/blender/editors/transform/transform_convert_mesh.cc
+@@ -6,8 +6,9 @@
+  * \ingroup edtransform
+  */
+
+ #include <algorithm>
++#include <cstdlib>
+
+ #include "DNA_mesh_types.h"
+
+ #include "MEM_guardedalloc.h"
+@@ -1624,8 +1625,12 @@
+     }
+
+     TransData *tob = tc->data;
+     TransDataMirror *td_mirror = tc->data_mirror;
++    static const bool reference_full_scan = std::getenv("BLENDER_RUST_EDIT_SCAN_FULL") !=
++                                            nullptr;
++    const bool skip_unselected_tail = !reference_full_scan && !prop_mode &&
++                                      !tc->use_mirror_axis_any;
+     BM_ITER_MESH_INDEX (eve, &iter, bm, BM_VERTS_OF_MESH, a) {
+       if (BM_elem_flag_test(eve, BM_ELEM_HIDDEN)) {
+         continue;
+       }
+@@ -1697,8 +1702,13 @@
+           }
+         }
+
+         tob++;
++        /* The selection size defines the allocation when neither proportional editing nor
++         * mirror is active. Remaining vertices cannot contribute transform data. */
++        if (skip_unselected_tail && tob == tc->data + tc->data_len) {
++          break;
++        }
+       }
+     }
+
+     transform_convert_mesh_islanddata_free(&island_data);

@@ -1,0 +1,2 @@
+/.githooks/* text eol=lf
+/ports/blender-screen-split/*.patch text eol=lf

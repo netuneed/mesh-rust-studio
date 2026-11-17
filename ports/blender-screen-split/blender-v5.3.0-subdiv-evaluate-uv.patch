@@ -1,0 +1,427 @@
+diff --git a/intern/opensubdiv/internal/evaluator/eval_output_cpu.cc b/intern/opensubdiv/internal/evaluator/eval_output_cpu.cc
+index 6eac9bc..0bf4642 100644
+--- a/intern/opensubdiv/internal/evaluator/eval_output_cpu.cc
++++ b/intern/opensubdiv/internal/evaluator/eval_output_cpu.cc
+@@ -17,5 +17,5 @@ namespace blender::opensubdiv {
+ using PatchDescriptor = OpenSubdiv::Far::PatchDescriptor;
+
+-static bool trace_position_evaluation()
++static bool trace_patch_evaluation()
+ {
+   static const bool enabled = std::getenv("BLENDER_RUST_SUBDIV_EVAL_TRACE") != nullptr;
+@@ -25,5 +25,5 @@ static bool trace_position_evaluation()
+ CpuEvalOutput::~CpuEvalOutput()
+ {
+-  if (trace_position_evaluation()) {
++  if (trace_patch_evaluation()) {
+     const CpuPatchTable *table = this->getPatchTable();
+     for (int type = 0; type < num_descriptor_types; type++) {
+@@ -37,4 +37,14 @@ CpuEvalOutput::~CpuEvalOutput()
+       }
+     }
++    for (int type = 0; type < num_descriptor_types; type++) {
++      const int64_t count = uv_samples_[type].load(std::memory_order_relaxed);
++      if (count != 0) {
++        std::fprintf(stderr,
++                     "RUST_SUBDIV_EVAL_UV type=%d samples=%lld rust=%lld\n",
++                     type,
++                     (long long)count,
++                     (long long)rust_uv_samples_[type].load(std::memory_order_relaxed));
++      }
++    }
+     for (int channel = 0; channel < table->GetNumFVarChannels(); channel++) {
+       if (table->GetNumPatchArrays() == 0 || table->GetFVarPatchParamSize(channel) == 0) {
+@@ -86,21 +96,62 @@ extern "C" uint8_t blender_rust_subdiv_position_batch(RustSubdivPositionPatch pa
+                                                       float *positions);
+
+-static bool evaluate_rust_position_batch(const CpuPatchTable &table,
+-                                         CpuVertexBuffer &vertices,
+-                                         const OpenSubdiv::Osd::PatchArray &array,
+-                                         const OpenSubdiv::Osd::PatchParam &param,
+-                                         const int type,
+-                                         const PatchCoord *coords,
+-                                         const int count,
+-                                         float *positions)
++struct RustSubdivUvPatch {
++  float control[16][2];
++  float scale, offset_u, offset_v;
++  uint32_t kind, boundary;
++};
++
++static_assert(sizeof(RustSubdivUvPatch) == 148 && alignof(RustSubdivUvPatch) == 4);
++static_assert(offsetof(RustSubdivUvPatch, control) == 0);
++static_assert(offsetof(RustSubdivUvPatch, scale) == 128);
++static_assert(offsetof(RustSubdivUvPatch, offset_u) == 132);
++static_assert(offsetof(RustSubdivUvPatch, offset_v) == 136);
++static_assert(offsetof(RustSubdivUvPatch, kind) == 140);
++static_assert(offsetof(RustSubdivUvPatch, boundary) == 144);
++
++extern "C" uint8_t blender_rust_subdiv_uv_batch(RustSubdivUvPatch patch,
++                                                const float (*coords)[2],
++                                                size_t count,
++                                                float *uv);
++
++template<int Width, typename RustPatch>
++static bool gather_control_points(const int *indices,
++                                  const float *source,
++                                  const int source_count,
++                                  const int controls,
++                                  RustPatch &patch)
++{
++  for (int i = 0; i < controls; i++) {
++    const int vertex = indices[i];
++    if (vertex < 0 || vertex >= source_count) {
++      return false;
++    }
++    std::copy_n(source + size_t(vertex) * Width, Width, patch.control[i]);
++  }
++  return true;
++}
++
++static bool evaluate_rust_batch(const int *indices,
++                                const size_t index_count,
++                                CpuVertexBuffer &vertices,
++                                const int src_offset,
++                                const int width,
++                                const OpenSubdiv::Osd::PatchArray &array,
++                                const OpenSubdiv::Osd::PatchParam &param,
++                                const int type,
++                                const PatchCoord *coords,
++                                const int count,
++                                float *output)
+ {
+   const int controls = type == PatchDescriptor::QUADS ? 4 : 16;
+-  if (count < 2 || count > 128 || vertices.GetNumElements() != 3 ||
++  if (count < 2 || count > 128 || vertices.GetNumElements() != width ||
+       (type != PatchDescriptor::QUADS &&
+-       (type != PatchDescriptor::REGULAR || param.GetBoundary() != 0 || param.sharpness != 0.0f)))
++       (type != PatchDescriptor::REGULAR || param.sharpness != 0.0f ||
++        (width == 3 && param.GetBoundary() != 0))) ||
++      src_offset < 0 || src_offset % width != 0)
+   {
+     return false;
+   }
+-  const int relative_index = coords[0].handle.patchIndex - array.GetPrimitiveIdBase();
++  const int64_t relative_index = int64_t(coords[0].handle.patchIndex) - array.GetPrimitiveIdBase();
+   if (relative_index < 0 || relative_index >= array.GetNumPatches() ||
+       array.GetStride() < controls || array.GetIndexBase() < 0)
+@@ -109,5 +160,4 @@ static bool evaluate_rust_position_batch(const CpuPatchTable &table,
+   }
+   const size_t start = size_t(array.GetIndexBase()) + size_t(array.GetStride()) * relative_index;
+-  const size_t index_count = table.GetPatchIndexSize();
+   if (start >= index_count || size_t(controls) > index_count - start ||
+       param.GetDepth() < int(param.NonQuadRoot()))
+@@ -115,29 +165,48 @@ static bool evaluate_rust_position_batch(const CpuPatchTable &table,
+     return false;
+   }
+-  const int *indices = table.GetPatchIndexBuffer() + start;
+-  const float *source = vertices.BindCpuBuffer();
+-  const int source_count = vertices.GetNumVertices();
+-  RustSubdivPositionPatch patch = {};
+-  patch.scale = 1.0f / param.GetParamFraction();
+-  patch.offset_u = float(param.GetU());
+-  patch.offset_v = float(param.GetV());
+-  patch.kind = type == PatchDescriptor::QUADS ? 0 : 1;
+-  for (int index = 0; index < controls; index++) {
+-    const int vertex = indices[index];
+-    if (vertex < 0 || vertex >= source_count) {
+-      return false;
+-    }
+-    std::copy_n(source + size_t(vertex) * 3, 3, patch.control[index]);
++  const int source_count = vertices.GetNumVertices() - src_offset / width;
++  const float *buffer = vertices.BindCpuBuffer();
++  if (!buffer || source_count <= 0) {
++    return false;
+   }
+-  float uv[128][2];
++  const float *source = buffer + src_offset;
++  const float scale = 1.0f / param.GetParamFraction();
++  const float offset_u = float(param.GetU());
++  const float offset_v = float(param.GetV());
++  const uint32_t kind = type == PatchDescriptor::QUADS ? 0 : 1;
++  float coordinates[128][2];
+   for (int index = 0; index < count; index++) {
+-    uv[index][0] = coords[index].s;
+-    uv[index][1] = coords[index].t;
++    coordinates[index][0] = coords[index].s;
++    coordinates[index][1] = coords[index].t;
++  }
++
++  if (width == 2) {
++    RustSubdivUvPatch patch = {{}, scale, offset_u, offset_v, kind, param.GetBoundary()};
++    return gather_control_points<2>(indices + start, source, source_count, controls, patch) &&
++           blender_rust_subdiv_uv_batch(patch, coordinates, size_t(count), output) == 1;
+   }
+-  return blender_rust_subdiv_position_batch(patch, uv, size_t(count), positions) == 1;
++  RustSubdivPositionPatch patch = {{}, scale, offset_u, offset_v, kind};
++  return gather_control_points<3>(indices + start, source, source_count, controls, patch) &&
++         blender_rust_subdiv_position_batch(patch, coordinates, size_t(count), output) == 1;
+ }
+ #endif
+
+ void CpuEvalOutput::evalPatches(const PatchCoord *coords, const int count, float *positions)
++{
++  this->evaluate_batch(-1, coords, count, positions);
++}
++
++void CpuEvalOutput::evalPatchesFaceVarying(const int channel,
++                                           const PatchCoord *coords,
++                                           const int count,
++                                           float *uv)
++{
++  this->evaluate_batch(channel, coords, count, uv);
++}
++
++void CpuEvalOutput::evaluate_batch(const int channel,
++                                   const PatchCoord *coords,
++                                   const int count,
++                                   float *output)
+ {
+   using StockEvaluator = VolatileEvalOutput<CpuVertexBuffer,
+@@ -146,23 +215,60 @@ void CpuEvalOutput::evalPatches(const PatchCoord *coords, const int count, float
+                                             CpuPatchTable,
+                                             CpuEvaluator>;
+-  const bool trace = trace_position_evaluation();
++  const bool face_varying = channel >= 0;
++  const int width = face_varying ? 2 : 3;
++  const auto stock_evaluate = [&](const int first, const int num) {
++    if (face_varying) {
++      StockEvaluator::evalPatchesFaceVarying(channel, coords + first, num, output + 2 * first);
++    }
++    else {
++      StockEvaluator::evalPatches(coords + first, num, output + 3 * first);
++    }
++  };
++  if (count <= 1) {
++    stock_evaluate(0, count);
++    return;
++  }
++
++  const bool trace = trace_patch_evaluation();
+ #ifdef WITH_BLENDER_RUST_SUBDIV_EVAL
+-  static const bool use_rust = std::getenv("BLENDER_RUST_SUBDIV_EVAL_CPP") == nullptr &&
+-                               std::getenv("BLENDER_RUST_SUBDIV_CPP") == nullptr;
++  static const bool use_rust_eval = std::getenv("BLENDER_RUST_SUBDIV_EVAL_CPP") == nullptr &&
++                                    std::getenv("BLENDER_RUST_SUBDIV_CPP") == nullptr;
++  static const bool use_rust_uv = std::getenv("BLENDER_RUST_SUBDIV_UV_EVAL_CPP") == nullptr;
++  const bool use_rust = use_rust_eval && (!face_varying || use_rust_uv);
+ #else
+   constexpr bool use_rust = false;
+ #endif
+-  if (count <= 1 || (!use_rust && !trace)) {
+-    StockEvaluator::evalPatches(coords, count, positions);
++  if (!use_rust && !trace) {
++    stock_evaluate(0, count);
+     return;
+   }
+
+   const CpuPatchTable &table = *this->getPatchTable();
+-  if (table.GetNumPatchArrays() == 0 || table.GetPatchParamSize() == 0) {
+-    StockEvaluator::evalPatches(coords, count, positions);
++  if (face_varying && channel >= table.GetNumFVarChannels()) {
++    return;
++  }
++  const size_t num_arrays = table.GetNumPatchArrays();
++  const size_t num_params = face_varying ? table.GetFVarPatchParamSize(channel) :
++                                           table.GetPatchParamSize();
++  if (num_arrays == 0 || num_params == 0) {
++    stock_evaluate(0, count);
+     return;
+   }
+-  const auto *arrays = table.GetPatchArrayBuffer();
+-  const auto *params = table.GetPatchParamBuffer();
++  const auto *arrays = face_varying ? table.GetFVarPatchArrayBuffer(channel) :
++                                      table.GetPatchArrayBuffer();
++  const auto *params = face_varying ? table.GetFVarPatchParamBuffer(channel) :
++                                      table.GetPatchParamBuffer();
++#ifdef WITH_BLENDER_RUST_SUBDIV_EVAL
++  const size_t num_indices = face_varying ? table.GetFVarPatchIndexSize(channel) :
++                                            table.GetPatchIndexSize();
++  const int *indices = num_indices == 0 ? nullptr :
++                       face_varying     ? table.GetFVarPatchIndexBuffer(channel) :
++                                          table.GetPatchIndexBuffer();
++  CpuVertexBuffer *vertices = face_varying ? this->getFVarSrcBuffer(channel) :
++                                             this->getSrcBuffer();
++  const int src_offset = face_varying ? this->get_face_varying_source_offset(channel) : 0;
++#endif
++  auto &samples = face_varying ? uv_samples_ : position_samples_;
++  auto &rust_samples = face_varying ? rust_uv_samples_ : rust_samples_;
+   for (int first = 0; first < count;) {
+     const auto handle = coords[first].handle;
+@@ -173,8 +279,8 @@ void CpuEvalOutput::evalPatches(const PatchCoord *coords, const int count, float
+       last++;
+     }
+-    if (handle.arrayIndex < 0 || size_t(handle.arrayIndex) >= table.GetNumPatchArrays() ||
+-        handle.patchIndex < 0 || size_t(handle.patchIndex) >= table.GetPatchParamSize())
++    if (handle.arrayIndex < 0 || size_t(handle.arrayIndex) >= num_arrays ||
++        handle.patchIndex < 0 || size_t(handle.patchIndex) >= num_params)
+     {
+-      StockEvaluator::evalPatches(coords + first, last - first, positions + 3 * first);
++      stock_evaluate(first, last - first);
+       first = last;
+       continue;
+@@ -186,20 +292,24 @@ void CpuEvalOutput::evalPatches(const PatchCoord *coords, const int count, float
+     bool processed = false;
+ #ifdef WITH_BLENDER_RUST_SUBDIV_EVAL
+-    processed = use_rust && evaluate_rust_position_batch(table,
+-                                                         *this->getSrcBuffer(),
+-                                                         array,
+-                                                         param,
+-                                                         type,
+-                                                         coords + first,
+-                                                         last - first,
+-                                                         positions + 3 * first);
++    processed = use_rust && vertices && indices &&
++                evaluate_rust_batch(indices,
++                                    num_indices,
++                                    *vertices,
++                                    src_offset,
++                                    width,
++                                    array,
++                                    param,
++                                    type,
++                                    coords + first,
++                                    last - first,
++                                    output + width * first);
+ #endif
+     if (!processed) {
+-      StockEvaluator::evalPatches(coords + first, last - first, positions + 3 * first);
++      stock_evaluate(first, last - first);
+     }
+     if (trace && type >= 0 && type < num_descriptor_types) {
+-      position_samples_[type].fetch_add(last - first, std::memory_order_relaxed);
++      samples[type].fetch_add(last - first, std::memory_order_relaxed);
+       if (processed) {
+-        rust_samples_[type].fetch_add(last - first, std::memory_order_relaxed);
++        rust_samples[type].fetch_add(last - first, std::memory_order_relaxed);
+       }
+     }
+diff --git a/intern/opensubdiv/internal/evaluator/eval_output_cpu.h b/intern/opensubdiv/internal/evaluator/eval_output_cpu.h
+index 13458cd..330e1fc 100644
+--- a/intern/opensubdiv/internal/evaluator/eval_output_cpu.h
++++ b/intern/opensubdiv/internal/evaluator/eval_output_cpu.h
+@@ -53,9 +53,17 @@ class CpuEvalOutput : public VolatileEvalOutput<CpuVertexBuffer,
+
+   void evalPatches(const PatchCoord *patch_coord, int num_patch_coords, float *P) override;
++  void evalPatchesFaceVarying(int channel,
++                              const PatchCoord *patch_coords,
++                              int count,
++                              float *uv) override;
+
+  private:
++  void evaluate_batch(int channel, const PatchCoord *coords, int count, float *output);
++
+   static constexpr int num_descriptor_types = 11;
+   std::array<std::atomic<int64_t>, num_descriptor_types> position_samples_{};
+   std::array<std::atomic<int64_t>, num_descriptor_types> rust_samples_{};
++  std::array<std::atomic<int64_t>, num_descriptor_types> uv_samples_{};
++  std::array<std::atomic<int64_t>, num_descriptor_types> rust_uv_samples_{};
+ };
+
+diff --git a/intern/opensubdiv/internal/evaluator/evaluator_impl.cc b/intern/opensubdiv/internal/evaluator/evaluator_impl.cc
+index 346e065..8647984 100644
+--- a/intern/opensubdiv/internal/evaluator/evaluator_impl.cc
++++ b/intern/opensubdiv/internal/evaluator/evaluator_impl.cc
+@@ -311,4 +311,14 @@ void EvalOutputAPI::evaluateFaceVarying(const int face_varying_channel,
+ }
+
++void EvalOutputAPI::evaluatePatchesFaceVarying(const int channel,
++                                               const OpenSubdiv_PatchCoord *patch_coords,
++                                               const int count,
++                                               float *face_varying)
++{
++  StackOrHeapPatchCoordArray patch_coords_array;
++  convertPatchCoordsToArray(patch_coords, count, patch_map_, &patch_coords_array);
++  implementation_->evalPatchesFaceVarying(channel, patch_coords_array.data(), count, face_varying);
++}
++
+ void EvalOutputAPI::evaluatePatchesLimit(const OpenSubdiv_PatchCoord *patch_coords,
+                                          const int num_patch_coords,
+diff --git a/intern/opensubdiv/opensubdiv_evaluator.hh b/intern/opensubdiv/opensubdiv_evaluator.hh
+index 7fbea30..a7f9e26 100644
+--- a/intern/opensubdiv/opensubdiv_evaluator.hh
++++ b/intern/opensubdiv/opensubdiv_evaluator.hh
+@@ -119,4 +119,10 @@ class EvalOutputAPI {
+                            float face_varying[2]);
+
++  /** Evaluate count face-varying samples into consecutive float pairs. */
++  void evaluatePatchesFaceVarying(int channel,
++                                 const OpenSubdiv_PatchCoord *patch_coords,
++                                 int count,
++                                 float *face_varying);
++
+   // Batched evaluation of multiple input coordinates.
+
+diff --git a/source/blender/blenkernel/BKE_subdiv_eval.hh b/source/blender/blenkernel/BKE_subdiv_eval.hh
+index 32b4208..89c0879 100644
+--- a/source/blender/blenkernel/BKE_subdiv_eval.hh
++++ b/source/blender/blenkernel/BKE_subdiv_eval.hh
+@@ -81,4 +81,10 @@ void eval_face_varying(Subdiv *subdiv,
+                        float v,
+                        float2 &r_face_varying);
++void eval_face_varying_grid_row(Subdiv *subdiv,
++                                int channel,
++                                int ptex_face_index,
++                                float step,
++                                float v,
++                                MutableSpan<float2> output);
+
+ /**
+diff --git a/source/blender/blenkernel/intern/subdiv_eval.cc b/source/blender/blenkernel/intern/subdiv_eval.cc
+index be07679..ec36033 100644
+--- a/source/blender/blenkernel/intern/subdiv_eval.cc
++++ b/source/blender/blenkernel/intern/subdiv_eval.cc
+@@ -11,4 +11,5 @@
+
+ #include <algorithm>
++#include <cstdlib>
+
+ #include "BLI_array_utils.hh"
+@@ -393,4 +394,32 @@ void eval_face_varying(Subdiv *subdiv,
+ }
+
++void eval_face_varying_grid_row(Subdiv *subdiv,
++                                const int channel,
++                                const int ptex_face_index,
++                                const float step,
++                                const float v,
++                                const MutableSpan<float2> output)
++{
++#ifdef WITH_OPENSUBDIV
++  static const bool use_scalar = std::getenv("BLENDER_SUBDIV_UV_EVAL_SCALAR") != nullptr;
++  if (!use_scalar && subdiv->evaluator->type == OPENSUBDIV_EVALUATOR_CPU) {
++    constexpr int batch_size = 128;
++    for (int64_t begin = 0; begin < output.size(); begin += batch_size) {
++      const int count = int(std::min<int64_t>(batch_size, output.size() - begin));
++      OpenSubdiv_PatchCoord coordinates[batch_size];
++      for (int index = 0; index < count; index++) {
++        coordinates[index] = {ptex_face_index, float(begin + index + 1) * step, v};
++      }
++      subdiv->evaluator->eval_output->evaluatePatchesFaceVarying(
++          channel, coordinates, count, output[begin]);
++    }
++    return;
++  }
++#endif
++  for (const int x : output.index_range()) {
++    eval_face_varying(subdiv, channel, ptex_face_index, float(x + 1) * step, v, output[x]);
++  }
++}
++
+ void eval_displacement(Subdiv *subdiv,
+                        const int ptex_face_index,
+diff --git a/source/blender/blenkernel/intern/subdiv_mesh.cc b/source/blender/blenkernel/intern/subdiv_mesh.cc
+index a8eaab5..b22a043 100644
+--- a/source/blender/blenkernel/intern/subdiv_mesh.cc
++++ b/source/blender/blenkernel/intern/subdiv_mesh.cc
+@@ -1412,8 +1412,6 @@ static void subdiv_mesh_uv_inner_grid(SubdivMeshContext &ctx,
+   Array<float2> previous(width), next(width);
+   const auto evaluate_row = [&](const int channel, const int y, MutableSpan<float2> row) {
+-    for (const int x : row.index_range()) {
+-      eval_face_varying(
+-          ctx.subdiv, channel, ptex_face_index, float(x + 1) * step, float(y + 1) * step, row[x]);
+-    }
++    eval_face_varying_grid_row(
++        ctx.subdiv, channel, ptex_face_index, step, float(y + 1) * step, row);
+   };
+   for (const int channel : ctx.uv_maps.index_range()) {

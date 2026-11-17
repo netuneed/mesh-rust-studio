@@ -1,0 +1,179 @@
+--- a/source/blender/blenkernel/CMakeLists.txt
++++ b/source/blender/blenkernel/CMakeLists.txt
+@@ -772,6 +772,8 @@
+     WITH_BLENDER_RUST_ARMATURE)
+   set_property(SOURCE intern/curve_to_mesh_convert.cc APPEND PROPERTY COMPILE_DEFINITIONS
+     WITH_BLENDER_RUST_CURVE_RING)
++  set_property(SOURCE intern/subdiv_mesh.cc APPEND PROPERTY COMPILE_DEFINITIONS
++    WITH_BLENDER_RUST_SUBDIV_EDGES)
+   target_link_libraries(bf_blenkernel PRIVATE "${BLENDER_RUST_SCREEN_SPLIT_LIB}")
+ endif()
+
+--- a/source/blender/blenkernel/BKE_subdiv_foreach.hh
++++ b/source/blender/blenkernel/BKE_subdiv_foreach.hh
+@@ -132,6 +132,12 @@
+    * will be passed as coarse_edge_index.
+    */
+   ForeachEdgeCb edge = nullptr;
++
++  /** Optional bulk emission for edges strictly inside a regular patch. */
++  bool (*regular_inner_edges)(const ForeachContext *context,
++                              int first_edge,
++                              int first_vertex,
++                              int width) = nullptr;
+   /**
+    * \note If subdivided loop does not come from coarse loop, ORIGINDEX_NONE
+    * will be passed as coarse_loop_index.
+--- a/source/blender/blenkernel/intern/subdiv_foreach.cc
++++ b/source/blender/blenkernel/intern/subdiv_foreach.cc
+@@ -740,35 +740,44 @@
+                                ctx->subdiv_vert_offset[coarse_face_index];
+   const int num_subdiv_vertices_per_coarse_edge = resolution - 2;
+   int subdiv_edge_index = ctx->edge_inner_offset + ctx->subdiv_edge_offset[coarse_face_index];
+-  /* Traverse bottom row of edges (0-1, 1-2). */
+-  subdiv_edge_index = subdiv_foreach_edges_row(
+-      ctx, tls, ORIGINDEX_NONE, subdiv_edge_index, start_vert_index, resolution - 2);
+-  /* Traverse remaining edges. */
+-  for (int row = 0; row < resolution - 3; row++) {
+-    const int start_row_vert_index = start_vert_index + row * (resolution - 2);
+-    /* Traverse vertical columns.
+-     *
+-     * At first iteration it will be edges (0-3. 1-4, 2-5), then it
+-     * will be (3-6, 4-7, 5-8) and so on.
+-     */
+-    subdiv_edge_index = subdiv_foreach_edges_column(ctx,
+-                                                    tls,
+-                                                    ORIGINDEX_NONE,
+-                                                    ORIGINDEX_NONE,
+-                                                    subdiv_edge_index,
+-                                                    start_row_vert_index,
+-                                                    resolution - 2);
+-    /* Create horizontal edge row.
+-     *
+-     * At first iteration it will be edges (3-4, 4-5), then it will be
+-     * (6-7, 7-8) and so on.
+-     */
+-    subdiv_edge_index = subdiv_foreach_edges_row(ctx,
+-                                                 tls,
+-                                                 ORIGINDEX_NONE,
+-                                                 subdiv_edge_index,
+-                                                 start_row_vert_index + resolution - 2,
+-                                                 resolution - 2);
++  const int width = resolution - 2;
++  if (width > 1 && ctx->foreach_context->regular_inner_edges &&
++      ctx->foreach_context->regular_inner_edges(
++          ctx->foreach_context, subdiv_edge_index, start_vert_index, width))
++  {
++    subdiv_edge_index += 2 * width * (width - 1);
++  }
++  else {
++    /* Traverse bottom row of edges (0-1, 1-2). */
++    subdiv_edge_index = subdiv_foreach_edges_row(
++        ctx, tls, ORIGINDEX_NONE, subdiv_edge_index, start_vert_index, resolution - 2);
++    /* Traverse remaining edges. */
++    for (int row = 0; row < resolution - 3; row++) {
++      const int start_row_vert_index = start_vert_index + row * (resolution - 2);
++      /* Traverse vertical columns.
++       *
++       * At first iteration it will be edges (0-3. 1-4, 2-5), then it
++       * will be (3-6, 4-7, 5-8) and so on.
++       */
++      subdiv_edge_index = subdiv_foreach_edges_column(ctx,
++                                                      tls,
++                                                      ORIGINDEX_NONE,
++                                                      ORIGINDEX_NONE,
++                                                      subdiv_edge_index,
++                                                      start_row_vert_index,
++                                                      resolution - 2);
++      /* Create horizontal edge row.
++       *
++       * At first iteration it will be edges (3-4, 4-5), then it will be
++       * (6-7, 7-8) and so on.
++       */
++      subdiv_edge_index = subdiv_foreach_edges_row(ctx,
++                                                   tls,
++                                                   ORIGINDEX_NONE,
++                                                   subdiv_edge_index,
++                                                   start_row_vert_index + resolution - 2,
++                                                   resolution - 2);
++    }
+   }
+   /* Connect inner part of patch to boundary. */
+   for (int corner = 0; corner < coarse_face.size(); corner++) {
+--- a/source/blender/blenkernel/intern/subdiv_mesh.cc
++++ b/source/blender/blenkernel/intern/subdiv_mesh.cc
+@@ -5,6 +5,10 @@
+ /** \file
+  * \ingroup bke
+  */
++
++#include <cstddef>
++#include <cstdio>
++#include <cstdlib>
+
+ #include "DNA_key_types.h"
+ #include "DNA_mesh_types.h"
+@@ -1164,6 +1168,50 @@
+   }
+ }
+
++#ifdef WITH_BLENDER_RUST_SUBDIV_EDGES
++static_assert(sizeof(int2) == 8 && alignof(int2) == 4 && sizeof(int) == 4);
++
++/* The edge slice is exclusively owned by this face's traversal task. */
++extern "C" bool blender_rust_subdiv_inner_edges(void *output,
++                                                 size_t count,
++                                                 int width,
++                                                 int first_vertex);
++
++static bool subdiv_mesh_regular_inner_edges(const ForeachContext *foreach_context,
++                                             const int first_edge,
++                                             const int first_vertex,
++                                             const int width)
++{
++  SubdivMeshContext *ctx = static_cast<SubdivMeshContext *>(foreach_context->user_data);
++  /* Edge-domain attributes need the original per-edge default initialization. */
++  if (!ctx->coarse_edge_attrs.is_empty() || width < 2 || first_edge < 0 ||
++      first_vertex < 0)
++  {
++    return false;
++  }
++  const int64_t edge_count = 2 * int64_t(width) * (width - 1);
++  if (edge_count > ctx->subdiv_edges.size() - first_edge ||
++      int64_t(width) * width > ctx->subdiv_positions.size() - first_vertex)
++  {
++    return false;
++  }
++  MutableSpan<int2> output = ctx->subdiv_edges.slice(first_edge, edge_count);
++  if (!blender_rust_subdiv_inner_edges(output.data(), output.size(), width, first_vertex)) {
++    return false;
++  }
++  if (!ctx->subdiv_edge_origindex.is_empty()) {
++    ctx->subdiv_edge_origindex.slice(first_edge, edge_count).fill(ORIGINDEX_NONE);
++  }
++  /* Optimal display uses false for these edges, as already initialized. */
++  static const bool trace = std::getenv("BLENDER_RUST_SUBDIV_TRACE") != nullptr;
++  if (trace) {
++    std::fprintf(stderr, "RUST_SUBDIV_INNER_EDGES count=%lld width=%d\n",
++                 static_cast<long long>(edge_count), width);
++  }
++  return true;
++}
++#endif
++
+ static void subdiv_mesh_edge(const ForeachContext *foreach_context,
+                              void * /*tls*/,
+                              const int coarse_edge_index,
+@@ -1442,6 +1490,12 @@
+   foreach_context->vert_edge = subdiv_mesh_vert_edge;
+   foreach_context->vert_inner = subdiv_mesh_vert_inner;
+   foreach_context->edge = subdiv_mesh_edge;
++#ifdef WITH_BLENDER_RUST_SUBDIV_EDGES
++  static const bool force_cpp = std::getenv("BLENDER_RUST_SUBDIV_CPP") != nullptr;
++  if (!force_cpp) {
++    foreach_context->regular_inner_edges = subdiv_mesh_regular_inner_edges;
++  }
++#endif
+   foreach_context->loop = subdiv_mesh_loop;
+   foreach_context->faces = subdiv_mesh_face;
+   foreach_context->vert_loose = subdiv_mesh_vert_loose;

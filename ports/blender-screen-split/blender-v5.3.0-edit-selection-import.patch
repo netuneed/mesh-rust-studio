@@ -1,0 +1,41 @@
+diff --git a/source/blender/editors/mesh/editmesh_utils.cc b/source/blender/editors/mesh/editmesh_utils.cc
+--- a/source/blender/editors/mesh/editmesh_utils.cc
++++ b/source/blender/editors/mesh/editmesh_utils.cc
+@@ -6,8 +6,9 @@
+  * \ingroup edmesh
+  */
+
+ #include <algorithm>
++#include <cstdlib>
+
+ #include "MEM_guardedalloc.h"
+
+ #include "DNA_key_types.h"
+@@ -323,10 +324,25 @@
+
+   mesh->runtime->edit_mesh->selectmode = bm->selectmode = select_mode;
+   mesh->runtime->edit_mesh->mat_nr = (ob->actcol > 0) ? ob->actcol - 1 : 0;
+
+-  /* we need to flush selection because the mode may have changed from when last in editmode */
+-  EDBM_selectmode_flush(bm, select_mode);
++  /* The mode may have changed since the last edit session. The conversion sets selection
++   * through BMesh setters, so the counters are already correct and the flush maintains them.
++   * Empty and complete selection cannot change in any mode. Hidden elements are never selected
++   * by the conversion, so complete selection also implies there are no hidden elements. */
++  static const bool reference_selection_flush =
++      std::getenv("BLENDER_RUST_EDIT_SELECTION_FULL_FLUSH") != nullptr;
++  if (reference_selection_flush) {
++    EDBM_selectmode_flush(bm, select_mode);
++  }
++  else if (bm->totvertsel == 0 && bm->totedgesel == 0 && bm->totfacesel == 0) {
++    BM_select_history_clear(bm);
++  }
++  else if (bm->totvertsel != bm->totvert || bm->totedgesel != bm->totedge ||
++           bm->totfacesel != bm->totface)
++  {
++    BM_mesh_select_mode_flush_ex(bm, select_mode, BMSelectFlushFlag::None);
++  }
+
+   if (bm->uv_select_sync_valid) {
+     if (select_mode & (SCE_SELECT_VERTEX | SCE_SELECT_EDGE)) {
+       /* Flush the UV selection too, so it matches the mesh. */

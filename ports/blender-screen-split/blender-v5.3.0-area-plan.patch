@@ -1,0 +1,125 @@
+diff --git a/source/blender/editors/screen/screen_edit.cc b/source/blender/editors/screen/screen_edit.cc
+index 50c827e4..e124ca8c 100644
+--- a/source/blender/editors/screen/screen_edit.cc
++++ b/source/blender/editors/screen/screen_edit.cc
+@@ -7,6 +7,8 @@
+  */
+
+ #include <cmath>
++#include <cstddef>
++#include <cstdint>
+ #include <cstring>
+ #include <limits>
+
+@@ -100,6 +102,62 @@ static void screen_delarea(bContext *C, bScreen *screen, ScrArea *area)
+   MEM_delete(area);
+ }
+
++#ifdef WITH_BLENDER_RUST_SCREEN_SPLIT
++/* Keep these value types in sync with ports/blender-screen-split/split.rs. */
++struct RustSplitPoint {
++  int16_t x, y;
++};
++
++struct RustSplitCorners {
++  RustSplitPoint points[4];
++};
++
++struct RustSplitPlan {
++  RustSplitPoint points[2];
++  uint8_t edges[5][2];
++  uint8_t original_corners[4];
++  uint8_t new_corners[4];
++  uint8_t original_side;
++  uint8_t valid;
++};
++
++static_assert(sizeof(float) == 4 && alignof(float) == 4);
++static_assert(sizeof(RustSplitPoint) == 4 && alignof(RustSplitPoint) == 2);
++static_assert(offsetof(RustSplitPoint, x) == 0 && offsetof(RustSplitPoint, y) == 2);
++static_assert(sizeof(RustSplitCorners) == 16 && alignof(RustSplitCorners) == 2);
++static_assert(offsetof(RustSplitCorners, points) == 0);
++static_assert(sizeof(RustSplitPlan) == 28 && alignof(RustSplitPlan) == 2);
++static_assert(offsetof(RustSplitPlan, points) == 0);
++static_assert(offsetof(RustSplitPlan, edges) == 8);
++static_assert(offsetof(RustSplitPlan, original_corners) == 18);
++static_assert(offsetof(RustSplitPlan, new_corners) == 22);
++static_assert(offsetof(RustSplitPlan, original_side) == 26);
++static_assert(offsetof(RustSplitPlan, valid) == 27);
++
++extern "C" RustSplitPlan blender_screen_split_plan(RustSplitCorners corners,
++                                                   uint8_t axis,
++                                                   int16_t split,
++                                                   float fac);
++
++static bool rust_split_plan_valid(const RustSplitPlan &plan)
++{
++  if (plan.valid != 1 || plan.original_side > 1) {
++    return false;
++  }
++  for (const auto &edge : plan.edges) {
++    if (edge[0] >= 6 || edge[1] >= 6) {
++      return false;
++    }
++  }
++  for (int corner = 0; corner < 4; corner++) {
++    if (plan.original_corners[corner] >= 6 || plan.new_corners[corner] >= 6) {
++      return false;
++    }
++  }
++  return true;
++}
++#endif
++
+ ScrArea *area_split(const wmWindow *win,
+                     bScreen *screen,
+                     ScrArea *area,
+@@ -120,6 +178,40 @@ ScrArea *area_split(const wmWindow *win,
+     return nullptr;
+   }
+
++#ifdef WITH_BLENDER_RUST_SCREEN_SPLIT
++  const RustSplitCorners corners = {{
++      {area->v1->vec.x, area->v1->vec.y},
++      {area->v2->vec.x, area->v2->vec.y},
++      {area->v3->vec.x, area->v3->vec.y},
++      {area->v4->vec.x, area->v4->vec.y},
++  }};
++  const uint8_t axis = dir_axis == SCREEN_AXIS_H ? 1 : 0;
++  const RustSplitPlan plan = blender_screen_split_plan(corners, axis, split, fac);
++  if (!rust_split_plan_valid(plan)) {
++    return nullptr;
++  }
++
++  ScrVert *vertices[6] = {area->v1, area->v2, area->v3, area->v4};
++  vertices[4] = screen_geom_vertex_add(screen, plan.points[0].x, plan.points[0].y);
++  vertices[5] = screen_geom_vertex_add(screen, plan.points[1].x, plan.points[1].y);
++  for (const auto &edge : plan.edges) {
++    screen_geom_edge_add(screen, vertices[edge[0]], vertices[edge[1]]);
++  }
++  const auto &new_corners = plan.new_corners;
++  newa = screen_addarea(screen,
++                        vertices[new_corners[0]],
++                        vertices[new_corners[1]],
++                        vertices[new_corners[2]],
++                        vertices[new_corners[3]],
++                        eSpace_Type(area->spacetype));
++
++  const auto &original_corners = plan.original_corners;
++  area->v1 = vertices[original_corners[0]];
++  area->v2 = vertices[original_corners[1]];
++  area->v3 = vertices[original_corners[2]];
++  area->v4 = vertices[original_corners[3]];
++  ED_area_data_copy(newa, area, true);
++#else
+   /* NOTE(@ideasman42): regarding (fac > 0.5f) checks below.
+    * normally it shouldn't matter which is used since the copy should match the original
+    * however with viewport rendering and python console this isn't the case. */
+@@ -186,6 +278,7 @@ ScrArea *area_split(const wmWindow *win,
+
+     ED_area_data_copy(newa, area, true);
+   }
++#endif
+
+   BKE_screen_remove_double_scredges(screen);
+   BKE_screen_remove_unused_scredges(screen);

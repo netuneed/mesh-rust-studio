@@ -1,0 +1,97 @@
+diff --git a/source/blender/modifiers/intern/MOD_nodes.cc b/source/blender/modifiers/intern/MOD_nodes.cc
+index 10d35e49..e1f897a6 100644
+--- a/source/blender/modifiers/intern/MOD_nodes.cc
++++ b/source/blender/modifiers/intern/MOD_nodes.cc
+@@ -112,10 +112,22 @@ static void init_data(ModifierData *md)
+ static void find_dependencies_from_settings(const NodesModifierData &nmd,
+                                             nodes::EvalDependencies &deps)
+ {
++  Set<const IDProperty *> unused_values;
++  const IDProperty *inputs = IDP_GetPropertyFromGroup_null(nmd.modifier.system_properties, "inputs");
++  if (inputs && inputs->type == IDP_GROUP) {
++    for (const std::string &identifier : deps.unlinked_modifier_id_inputs) {
++      const IDProperty *input = IDP_GetPropertyTypeFromGroup(inputs, identifier, IDP_GROUP);
++      if (input) {
++        if (const IDProperty *value = IDP_GetPropertyTypeFromGroup(input, "value", IDP_ID)) {
++          unused_values.add(value);
++        }
++      }
++    }
++  }
+   IDP_foreach_property(
+       nmd.modifier.system_properties, IDP_TYPE_FILTER_ID, [&](IDProperty *property) {
+-        if (ID *id = IDP_ID_get(property)) {
+-          deps.add_generic_id_full(id);
++        if (!unused_values.contains(property)) {
++          deps.add_generic_id_full(IDP_ID_get(property));
+         }
+       });
+ }
+diff --git a/source/blender/nodes/NOD_dependencies.hh b/source/blender/nodes/NOD_dependencies.hh
+index 241ffef4..d0ffabf3 100644
+--- a/source/blender/nodes/NOD_dependencies.hh
++++ b/source/blender/nodes/NOD_dependencies.hh
+@@ -8,7 +8,10 @@
+
+ #pragma once
+
++#include <string>
++
+ #include "BLI_map.hh"
++#include "BLI_set.hh"
+
+ namespace blender {
+
+@@ -46,6 +49,9 @@ struct EvalDependencies {
+   /** Additional information for object dependencies. */
+   Map<uint32_t, ObjectDependencyInfo> objects_info;
+
++  /** Only for this tree: Object/Collection interface inputs with no Group Input links. */
++  Set<std::string> unlinked_modifier_id_inputs;
++
+   bool needs_own_transform = false;
+   bool needs_active_camera = false;
+   bool needs_scene_render_params = false;
+diff --git a/source/blender/nodes/intern/dependencies.cc b/source/blender/nodes/intern/dependencies.cc
+index 95386708..0815ae9c 100644
+--- a/source/blender/nodes/intern/dependencies.cc
++++ b/source/blender/nodes/intern/dependencies.cc
+@@ -260,12 +260,38 @@ static bool needs_scene_render_params(const bNodeTree &ntree)
+   return false;
+ }
+
++static void gather_unlinked_modifier_id_inputs(const bNodeTree &ntree, EvalDependencies &deps)
++{
++  ntree.ensure_interface_cache();
++  for (const bNodeTreeInterfaceSocket *input : ntree.interface_inputs()) {
++    const bke::bNodeSocketType *type = input->socket_typeinfo();
++    if (type && (type->type == SOCK_OBJECT || type->type == SOCK_COLLECTION)) {
++      deps.unlinked_modifier_id_inputs.add(input->identifier);
++    }
++  }
++  if (deps.unlinked_modifier_id_inputs.is_empty()) {
++    return;
++  }
++  /* Keep every direct link, including links used by viewers, baking and dynamic branches. */
++  for (const bNode *node : ntree.group_input_nodes()) {
++    for (const bNodeSocket *output : node->output_sockets()) {
++      if (output->is_directly_linked()) {
++        deps.unlinked_modifier_id_inputs.remove(output->identifier);
++      }
++    }
++  }
++}
++
+ static void gather_geometry_nodes_eval_dependencies(
+     const bNodeTree &ntree,
+     EvalDependencies &deps,
+     FunctionRef<const EvalDependencies *(const bNodeTree &group)> get_group_deps)
+ {
+   ntree.ensure_topology_cache();
++  if (ntree.type == NTREE_GEOMETRY) {
++    /* Include connectivity in the cached dependencies so relinking rebuilds relations. */
++    gather_unlinked_modifier_id_inputs(ntree, deps);
++  }
+   for (const bNodeSocket *socket : ntree.all_sockets()) {
+     add_eval_dependencies_from_socket(*socket, deps);
+   }

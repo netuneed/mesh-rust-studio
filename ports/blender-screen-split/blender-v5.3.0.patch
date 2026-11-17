@@ -1,0 +1,75 @@
+diff --git a/source/blender/editors/screen/CMakeLists.txt b/source/blender/editors/screen/CMakeLists.txt
+index 50d6e4ae..f6891ddf 100644
+--- a/source/blender/editors/screen/CMakeLists.txt
++++ b/source/blender/editors/screen/CMakeLists.txt
+@@ -64,5 +64,18 @@ endif()
+
+ blender_add_lib(bf_editor_screen "${SRC}" "${INC}" "${INC_SYS}" "${LIB}")
+
++set(BLENDER_RUST_SCREEN_SPLIT_LIB "" CACHE FILEPATH "Rust static library for area split geometry")
++if(BLENDER_RUST_SCREEN_SPLIT_LIB)
++  if(NOT EXISTS "${BLENDER_RUST_SCREEN_SPLIT_LIB}")
++    message(FATAL_ERROR "BLENDER_RUST_SCREEN_SPLIT_LIB must point to an existing static library")
++  endif()
++  target_compile_definitions(bf_editor_screen PRIVATE WITH_BLENDER_RUST_SCREEN_SPLIT)
++  target_link_libraries(bf_editor_screen PRIVATE "${BLENDER_RUST_SCREEN_SPLIT_LIB}")
++  if(MSVC)
++    # Rust 1.99 x86_64-pc-windows-msvc native-static-libs. The executable uses /MD.
++    target_link_libraries(bf_editor_screen PRIVATE kernel32 ntdll userenv ws2_32 dbghelp)
++  endif()
++endif()
++
+ # RNA_prototypes.hh
+ add_dependencies(bf_editor_screen bf_rna)
+diff --git a/source/blender/editors/screen/screen_geometry.cc b/source/blender/editors/screen/screen_geometry.cc
+index 5de82686..d1643c88 100644
+--- a/source/blender/editors/screen/screen_geometry.cc
++++ b/source/blender/editors/screen/screen_geometry.cc
+@@ -295,11 +295,39 @@ void screen_geom_vertices_scale(const wmWindow *win, bScreen *screen)
+   }
+ }
+
++#ifdef WITH_BLENDER_RUST_SCREEN_SPLIT
++extern "C" short blender_screen_split_point(short area_start,
++                                             short area_end,
++                                             int window_start,
++                                             int window_end,
++                                             short minimum,
++                                             float pixel_size,
++                                             float factor);
++#endif
++
+ short screen_geom_find_area_split_point(const ScrArea *area,
+                                         const rcti *window_rect,
+                                         const eScreenAxis dir_axis,
+                                         float fac)
+ {
++#ifdef WITH_BLENDER_RUST_SCREEN_SPLIT
++  if (dir_axis == SCREEN_AXIS_H) {
++    return blender_screen_split_point(area->v1->vec.y,
++                                      area->v2->vec.y,
++                                      window_rect->ymin,
++                                      window_rect->ymax,
++                                      ED_area_headersize(),
++                                      U.pixelsize,
++                                      fac);
++  }
++  return blender_screen_split_point(area->v1->vec.x,
++                                    area->v4->vec.x,
++                                    window_rect->xmin,
++                                    window_rect->xmax,
++                                    AREAMINX * UI_SCALE_FAC,
++                                    U.pixelsize,
++                                    fac);
++#else
+   const int cur_area_width = screen_geom_area_width(area);
+   const int cur_area_height = screen_geom_area_height(area);
+   const short area_min_x = AREAMINX * UI_SCALE_FAC;
+@@ -361,6 +389,7 @@ short screen_geom_find_area_split_point(const ScrArea *area,
+   }
+
+   return x;
++#endif
+ }
+
+ void screen_geom_select_connected_edge(const wmWindow *win, ScrEdge *edge)

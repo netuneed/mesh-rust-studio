@@ -1,0 +1,251 @@
+diff --git a/source/blender/blenkernel/BKE_subdiv_foreach.hh b/source/blender/blenkernel/BKE_subdiv_foreach.hh
+index 1eec6ac..86fb34d 100644
+--- a/source/blender/blenkernel/BKE_subdiv_foreach.hh
++++ b/source/blender/blenkernel/BKE_subdiv_foreach.hh
+@@ -147,6 +147,15 @@ struct ForeachContext {
+    */
+   ForeachLoopCb loop = nullptr;
+
++  /** Emit the corners and their data for the interior faces of one regular patch. */
++  bool (*regular_inner_loops)(const ForeachContext *context,
++                              int first_loop,
++                              int first_vertex,
++                              int first_edge,
++                              int width,
++                              int ptex_face_index,
++                              float step) = nullptr;
++
+   /**
+    * Called once for the whole mesh, passing the #OffsetIndices encoding the groups of subdivided
+    * faces corresponding to each base mesh face.
+diff --git a/source/blender/blenkernel/intern/subdiv_foreach.cc b/source/blender/blenkernel/intern/subdiv_foreach.cc
+index 501027a..6f9bae9 100644
+--- a/source/blender/blenkernel/intern/subdiv_foreach.cc
++++ b/source/blender/blenkernel/intern/subdiv_foreach.cc
+@@ -1095,9 +1095,21 @@ static void subdiv_foreach_loops_regular(ForeachTaskContext *ctx,
+   const float du = inv_ptex_resolution_1;
+   const float dv = inv_ptex_resolution_1;
+   /* Hi-poly subdivided mesh. */
+-  int subdiv_loop_index = start_loop_index;
+   /* Loops for inner part of ptex. */
+-  for (int y = 1; y < ptex_resolution - 2; y++) {
++  const bool inner_loops_emitted = ptex_inner_resolution > 1 &&
++                                   ctx->foreach_context->regular_inner_loops &&
++                                   ctx->foreach_context->regular_inner_loops(ctx->foreach_context,
++                                                                             start_loop_index,
++                                                                             start_vert_index,
++                                                                             start_edge_index,
++                                                                             ptex_inner_resolution,
++                                                                             ptex_face_index,
++                                                                             du);
++  int subdiv_loop_index = start_loop_index;
++  if (inner_loops_emitted) {
++    subdiv_loop_index += 4 * (ptex_inner_resolution - 1) * (ptex_inner_resolution - 1);
++  }
++  for (int y = 1; !inner_loops_emitted && y < ptex_resolution - 2; y++) {
+     const float v = y * inv_ptex_resolution_1;
+     const int inner_y = y - 1;
+     for (int x = 1; x < ptex_resolution - 2; x++, subdiv_loop_index += 4) {
+diff --git a/source/blender/blenkernel/intern/subdiv_mesh.cc b/source/blender/blenkernel/intern/subdiv_mesh.cc
+index efb86a7..e9185b9 100644
+--- a/source/blender/blenkernel/intern/subdiv_mesh.cc
++++ b/source/blender/blenkernel/intern/subdiv_mesh.cc
+@@ -6,6 +6,7 @@
+  * \ingroup bke
+  */
+
++#include <bit>
+ #include <cstddef>
+ #include <cstdio>
+ #include <cstdlib>
+@@ -815,6 +816,38 @@ static void create_attrs_and_retrieve_interp_spans(const AttributeAccessor src_a
+   });
+ }
+
++#ifdef WITH_BLENDER_RUST_SUBDIV_EDGES
++extern "C" bool blender_rust_subdiv_quad_offsets(int *output, size_t count, int first_face);
++
++static bool subdiv_mesh_use_rust_topology()
++{
++  static const bool use_rust = std::getenv("BLENDER_RUST_SUBDIV_CPP") == nullptr;
++  return use_rust;
++}
++
++static bool subdiv_mesh_topology_trace()
++{
++  static const bool trace = std::getenv("BLENDER_RUST_SUBDIV_TRACE") != nullptr;
++  return trace;
++}
++
++static void subdiv_mesh_fill_face_offsets_rust(MutableSpan<int> offsets)
++{
++  threading::memory_bandwidth_bound_task(offsets.size_in_bytes(), [&]() {
++    threading::parallel_for(offsets.index_range(), 32768, [&](const IndexRange range) {
++      MutableSpan<int> output = offsets.slice(range);
++      if (!blender_rust_subdiv_quad_offsets(output.data(), output.size(), int(range.start()))) {
++        offset_indices::fill_constant_group_size(4, 4 * int(range.start()), output);
++      }
++    });
++  });
++  if (subdiv_mesh_topology_trace()) {
++    std::fprintf(
++        stderr, "RUST_SUBDIV_FACE_OFFSETS count=%lld\n", static_cast<long long>(offsets.size()));
++  }
++}
++#endif
++
+ static bool subdiv_mesh_topology_info(const ForeachContext *foreach_context,
+                                       const int num_vertices,
+                                       const int num_edges,
+@@ -835,7 +868,16 @@ static bool subdiv_mesh_topology_info(const ForeachContext *foreach_context,
+   BKE_mesh_copy_parameters_for_eval(subdiv_context->subdiv_mesh, &coarse_mesh);
+
+   if (num_faces != 0) {
+-    offset_indices::fill_constant_group_size(4, 0, subdiv_mesh.face_offsets_for_write());
++    MutableSpan<int> offsets = subdiv_mesh.face_offsets_for_write();
++#ifdef WITH_BLENDER_RUST_SUBDIV_EDGES
++    if (subdiv_mesh_use_rust_topology()) {
++      subdiv_mesh_fill_face_offsets_rust(offsets);
++    }
++    else
++#endif
++    {
++      offset_indices::fill_constant_group_size(4, 0, offsets);
++    }
+   }
+
+   /* Create corner data for interpolation without topology attributes. */
+@@ -1311,6 +1353,121 @@ static void subdiv_mesh_loop(const ForeachContext *foreach_context,
+   ctx->subdiv_corner_edges[subdiv_loop_index] = subdiv_edge_index;
+ }
+
++#ifdef WITH_BLENDER_RUST_SUBDIV_EDGES
++/* The two output spans are disjoint and owned by this coarse face's task. */
++extern "C" bool blender_rust_subdiv_inner_loops(int *corner_vertices,
++                                                int *corner_edges,
++                                                size_t quad_count,
++                                                int width,
++                                                int first_vertex,
++                                                int first_edge);
++
++static void subdiv_mesh_uv_inner_grid(SubdivMeshContext &ctx,
++                                      const int first_loop,
++                                      const int width,
++                                      const int ptex_face_index,
++                                      const float step)
++{
++  Array<float2> previous(width), next(width);
++  const auto evaluate_row = [&](const int channel, const int y, MutableSpan<float2> row) {
++    for (const int x : row.index_range()) {
++      eval_face_varying(
++          ctx.subdiv, channel, ptex_face_index, float(x + 1) * step, float(y + 1) * step, row[x]);
++    }
++  };
++  for (const int channel : ctx.uv_maps.index_range()) {
++    MutableSpan<float2> output = ctx.uv_maps[channel].span;
++    int corner = first_loop;
++    evaluate_row(channel, 0, previous);
++    for (int y = 1; y < width; y++) {
++      evaluate_row(channel, y, next);
++      for (int x = 0; x < width - 1; x++) {
++        output[corner++] = previous[x];
++        output[corner++] = previous[x + 1];
++        output[corner++] = next[x + 1];
++        output[corner++] = next[x];
++      }
++      std::swap(previous, next);
++    }
++  }
++}
++
++static bool subdiv_mesh_regular_inner_loops(const ForeachContext *foreach_context,
++                                            const int first_loop,
++                                            const int first_vertex,
++                                            const int first_edge,
++                                            const int width,
++                                            const int ptex_face_index,
++                                            const float step)
++{
++  SubdivMeshContext &ctx = *static_cast<SubdivMeshContext *>(foreach_context->user_data);
++  /* The per-loop path is needed for general attributes and custom normals. UVs are evaluated
++   * separately using the original immutable OpenSubdiv evaluator. */
++  if (width < 2 || width > 32768 || first_loop < 0 || first_vertex < 0 || first_edge < 0 ||
++      !ctx.coarse_corner_attr_spans.is_empty() || !ctx.coarse_CD_NORMAL.is_empty() ||
++      !ctx.coarse_CD_ORIGSPACE_MLOOP.is_empty())
++  {
++    return false;
++  }
++  const int64_t quad_count = int64_t(width - 1) * (width - 1);
++  const int64_t corner_count = 4 * quad_count;
++  if (corner_count > ctx.subdiv_corner_verts.size() - first_loop ||
++      corner_count > ctx.subdiv_corner_edges.size() - first_loop ||
++      int64_t(width) * width > ctx.subdiv_positions.size() - first_vertex ||
++      2 * int64_t(width) * (width - 1) > ctx.subdiv_edges.size() - first_edge)
++  {
++    return false;
++  }
++  for (const auto &uv_map : ctx.uv_maps) {
++    if (corner_count > uv_map.span.size() - first_loop) {
++      return false;
++    }
++  }
++  MutableSpan<int> vertices = ctx.subdiv_corner_verts.slice(first_loop, corner_count);
++  MutableSpan<int> edges = ctx.subdiv_corner_edges.slice(first_loop, corner_count);
++  if (!blender_rust_subdiv_inner_loops(
++          vertices.data(), edges.data(), quad_count, width, first_vertex, first_edge))
++  {
++    return false;
++  }
++
++  int64_t uv_evaluations = 0;
++  if (!ctx.uv_maps.is_empty()) {
++    static const bool reference_uv = std::getenv("BLENDER_RUST_SUBDIV_UV_REFERENCE") != nullptr;
++    /* For bounded dyadic grids, x*step and (x-1)*step+step are bit-identical. Neighboring faces
++     * may share these samples inside this PTEX face. Never reuse across PTEX/UV boundaries. */
++    const bool exact_grid = std::has_single_bit(unsigned(width + 1)) &&
++                            step == 1.0f / float(width + 1);
++    if (!reference_uv && exact_grid) {
++      subdiv_mesh_uv_inner_grid(ctx, first_loop, width, ptex_face_index, step);
++      uv_evaluations = int64_t(width) * width * ctx.uv_maps.size();
++    }
++    else {
++      int i = first_loop;
++      for (int y = 1; y < width; y++) {
++        const float v = y * step;
++        for (int x = 1; x < width; x++) {
++          const float u = x * step;
++          subdiv_eval_uv_layer(&ctx, i++, ptex_face_index, u, v);
++          subdiv_eval_uv_layer(&ctx, i++, ptex_face_index, u + step, v);
++          subdiv_eval_uv_layer(&ctx, i++, ptex_face_index, u + step, v + step);
++          subdiv_eval_uv_layer(&ctx, i++, ptex_face_index, u, v + step);
++        }
++      }
++      uv_evaluations = corner_count * ctx.uv_maps.size();
++    }
++  }
++  if (subdiv_mesh_topology_trace()) {
++    std::fprintf(stderr,
++                 "RUST_SUBDIV_INNER_LOOPS count=%lld width=%d uv_evaluations=%lld\n",
++                 static_cast<long long>(corner_count),
++                 width,
++                 static_cast<long long>(uv_evaluations));
++  }
++  return true;
++}
++#endif
++
+ /** \} */
+
+ /* -------------------------------------------------------------------- */
+@@ -1497,6 +1654,11 @@ static void setup_foreach_callbacks(const SubdivMeshContext *subdiv_context,
+   }
+ #endif
+   foreach_context->loop = subdiv_mesh_loop;
++#ifdef WITH_BLENDER_RUST_SUBDIV_EDGES
++  if (subdiv_mesh_use_rust_topology()) {
++    foreach_context->regular_inner_loops = subdiv_mesh_regular_inner_loops;
++  }
++#endif
+   foreach_context->faces = subdiv_mesh_face;
+   foreach_context->vert_loose = subdiv_mesh_vert_loose;
+   foreach_context->vert_of_loose_edge = subdiv_mesh_vert_of_loose_edge;

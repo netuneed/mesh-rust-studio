@@ -1,0 +1,400 @@
+diff --git a/intern/opensubdiv/CMakeLists.txt b/intern/opensubdiv/CMakeLists.txt
+index b87e0e7..381a8f0 100644
+--- a/intern/opensubdiv/CMakeLists.txt
++++ b/intern/opensubdiv/CMakeLists.txt
+@@ -142,2 +142,8 @@ endif()
+
+ blender_add_lib(bf_intern_opensubdiv "${SRC}" "${INC}" "${INC_SYS}" "${LIB}")
++
++if(WITH_OPENSUBDIV AND BLENDER_RUST_SCREEN_SPLIT_LIB)
++  set_property(SOURCE internal/evaluator/eval_output_cpu.cc APPEND PROPERTY COMPILE_DEFINITIONS
++    WITH_BLENDER_RUST_SUBDIV_EVAL)
++  target_link_libraries(bf_intern_opensubdiv PRIVATE "${BLENDER_RUST_SCREEN_SPLIT_LIB}")
++endif()
+diff --git a/intern/opensubdiv/internal/evaluator/eval_output_cpu.cc b/intern/opensubdiv/internal/evaluator/eval_output_cpu.cc
+index 71b8a92..6eac9bc 100644
+--- a/intern/opensubdiv/internal/evaluator/eval_output_cpu.cc
++++ b/intern/opensubdiv/internal/evaluator/eval_output_cpu.cc
+@@ -5,5 +5,206 @@
+  * Author: Sergey Sharybin. */
+
++#include "internal/evaluator/eval_output_cpu.h"
++
++#include <algorithm>
++#include <cstddef>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++
+ namespace blender::opensubdiv {
+
++using PatchDescriptor = OpenSubdiv::Far::PatchDescriptor;
++
++static bool trace_position_evaluation()
++{
++  static const bool enabled = std::getenv("BLENDER_RUST_SUBDIV_EVAL_TRACE") != nullptr;
++  return enabled;
++}
++
++CpuEvalOutput::~CpuEvalOutput()
++{
++  if (trace_position_evaluation()) {
++    const CpuPatchTable *table = this->getPatchTable();
++    for (int type = 0; type < num_descriptor_types; type++) {
++      const int64_t count = position_samples_[type].load(std::memory_order_relaxed);
++      if (count != 0) {
++        std::fprintf(stderr,
++                     "RUST_SUBDIV_EVAL_POSITION type=%d samples=%lld rust=%lld\n",
++                     type,
++                     (long long)count,
++                     (long long)rust_samples_[type].load(std::memory_order_relaxed));
++      }
++    }
++    for (int channel = 0; channel < table->GetNumFVarChannels(); channel++) {
++      if (table->GetNumPatchArrays() == 0 || table->GetFVarPatchParamSize(channel) == 0) {
++        continue;
++      }
++      const auto *params = table->GetFVarPatchParamBuffer(channel);
++      const auto *arrays = table->GetFVarPatchArrayBuffer(channel);
++      std::array<int64_t, num_descriptor_types> counts = {};
++      for (size_t array = 0; array < table->GetNumPatchArrays(); array++) {
++        for (int patch = 0; patch < arrays[array].GetNumPatches(); patch++) {
++          const int index = arrays[array].GetPrimitiveIdBase() + patch;
++          const int type = params[index].IsRegular() ? arrays[array].GetPatchTypeRegular() :
++                                                       arrays[array].GetPatchTypeIrregular();
++          if (type >= 0 && type < num_descriptor_types) {
++            counts[type]++;
++          }
++        }
++      }
++      for (int type = 0; type < num_descriptor_types; type++) {
++        if (counts[type] != 0) {
++          std::fprintf(stderr,
++                       "RUST_SUBDIV_EVAL_UV_TABLE channel=%d type=%d patches=%lld\n",
++                       channel,
++                       type,
++                       (long long)counts[type]);
++        }
++      }
++    }
++  }
++}
++
++#ifdef WITH_BLENDER_RUST_SUBDIV_EVAL
++struct RustSubdivPositionPatch {
++  float control[16][3];
++  float scale, offset_u, offset_v;
++  uint32_t kind;
++};
++
++static_assert(sizeof(RustSubdivPositionPatch) == 208 && alignof(RustSubdivPositionPatch) == 4);
++static_assert(offsetof(RustSubdivPositionPatch, control) == 0);
++static_assert(offsetof(RustSubdivPositionPatch, scale) == 192);
++static_assert(offsetof(RustSubdivPositionPatch, offset_u) == 196);
++static_assert(offsetof(RustSubdivPositionPatch, offset_v) == 200);
++static_assert(offsetof(RustSubdivPositionPatch, kind) == 204);
++
++extern "C" uint8_t blender_rust_subdiv_position_batch(RustSubdivPositionPatch patch,
++                                                      const float (*uv)[2],
++                                                      size_t count,
++                                                      float *positions);
++
++static bool evaluate_rust_position_batch(const CpuPatchTable &table,
++                                         CpuVertexBuffer &vertices,
++                                         const OpenSubdiv::Osd::PatchArray &array,
++                                         const OpenSubdiv::Osd::PatchParam &param,
++                                         const int type,
++                                         const PatchCoord *coords,
++                                         const int count,
++                                         float *positions)
++{
++  const int controls = type == PatchDescriptor::QUADS ? 4 : 16;
++  if (count < 2 || count > 128 || vertices.GetNumElements() != 3 ||
++      (type != PatchDescriptor::QUADS &&
++       (type != PatchDescriptor::REGULAR || param.GetBoundary() != 0 || param.sharpness != 0.0f)))
++  {
++    return false;
++  }
++  const int relative_index = coords[0].handle.patchIndex - array.GetPrimitiveIdBase();
++  if (relative_index < 0 || relative_index >= array.GetNumPatches() ||
++      array.GetStride() < controls || array.GetIndexBase() < 0)
++  {
++    return false;
++  }
++  const size_t start = size_t(array.GetIndexBase()) + size_t(array.GetStride()) * relative_index;
++  const size_t index_count = table.GetPatchIndexSize();
++  if (start >= index_count || size_t(controls) > index_count - start ||
++      param.GetDepth() < int(param.NonQuadRoot()))
++  {
++    return false;
++  }
++  const int *indices = table.GetPatchIndexBuffer() + start;
++  const float *source = vertices.BindCpuBuffer();
++  const int source_count = vertices.GetNumVertices();
++  RustSubdivPositionPatch patch = {};
++  patch.scale = 1.0f / param.GetParamFraction();
++  patch.offset_u = float(param.GetU());
++  patch.offset_v = float(param.GetV());
++  patch.kind = type == PatchDescriptor::QUADS ? 0 : 1;
++  for (int index = 0; index < controls; index++) {
++    const int vertex = indices[index];
++    if (vertex < 0 || vertex >= source_count) {
++      return false;
++    }
++    std::copy_n(source + size_t(vertex) * 3, 3, patch.control[index]);
++  }
++  float uv[128][2];
++  for (int index = 0; index < count; index++) {
++    uv[index][0] = coords[index].s;
++    uv[index][1] = coords[index].t;
++  }
++  return blender_rust_subdiv_position_batch(patch, uv, size_t(count), positions) == 1;
++}
++#endif
++
++void CpuEvalOutput::evalPatches(const PatchCoord *coords, const int count, float *positions)
++{
++  using StockEvaluator = VolatileEvalOutput<CpuVertexBuffer,
++                                            CpuVertexBuffer,
++                                            StencilTable,
++                                            CpuPatchTable,
++                                            CpuEvaluator>;
++  const bool trace = trace_position_evaluation();
++#ifdef WITH_BLENDER_RUST_SUBDIV_EVAL
++  static const bool use_rust = std::getenv("BLENDER_RUST_SUBDIV_EVAL_CPP") == nullptr &&
++                               std::getenv("BLENDER_RUST_SUBDIV_CPP") == nullptr;
++#else
++  constexpr bool use_rust = false;
++#endif
++  if (count <= 1 || (!use_rust && !trace)) {
++    StockEvaluator::evalPatches(coords, count, positions);
++    return;
++  }
++
++  const CpuPatchTable &table = *this->getPatchTable();
++  if (table.GetNumPatchArrays() == 0 || table.GetPatchParamSize() == 0) {
++    StockEvaluator::evalPatches(coords, count, positions);
++    return;
++  }
++  const auto *arrays = table.GetPatchArrayBuffer();
++  const auto *params = table.GetPatchParamBuffer();
++  for (int first = 0; first < count;) {
++    const auto handle = coords[first].handle;
++    int last = first + 1;
++    while (last < count && coords[last].handle.arrayIndex == handle.arrayIndex &&
++           coords[last].handle.patchIndex == handle.patchIndex)
++    {
++      last++;
++    }
++    if (handle.arrayIndex < 0 || size_t(handle.arrayIndex) >= table.GetNumPatchArrays() ||
++        handle.patchIndex < 0 || size_t(handle.patchIndex) >= table.GetPatchParamSize())
++    {
++      StockEvaluator::evalPatches(coords + first, last - first, positions + 3 * first);
++      first = last;
++      continue;
++    }
++    const auto &array = arrays[handle.arrayIndex];
++    const auto &param = params[handle.patchIndex];
++    const int type = param.IsRegular() ? array.GetPatchTypeRegular() :
++                                         array.GetPatchTypeIrregular();
++    bool processed = false;
++#ifdef WITH_BLENDER_RUST_SUBDIV_EVAL
++    processed = use_rust && evaluate_rust_position_batch(table,
++                                                         *this->getSrcBuffer(),
++                                                         array,
++                                                         param,
++                                                         type,
++                                                         coords + first,
++                                                         last - first,
++                                                         positions + 3 * first);
++#endif
++    if (!processed) {
++      StockEvaluator::evalPatches(coords + first, last - first, positions + 3 * first);
++    }
++    if (trace && type >= 0 && type < num_descriptor_types) {
++      position_samples_[type].fetch_add(last - first, std::memory_order_relaxed);
++      if (processed) {
++        rust_samples_[type].fetch_add(last - first, std::memory_order_relaxed);
++      }
++    }
++    first = last;
++  }
++}
++
+ }  // namespace blender::opensubdiv
+diff --git a/intern/opensubdiv/internal/evaluator/eval_output_cpu.h b/intern/opensubdiv/internal/evaluator/eval_output_cpu.h
+index 97be35e..13458cd 100644
+--- a/intern/opensubdiv/internal/evaluator/eval_output_cpu.h
++++ b/intern/opensubdiv/internal/evaluator/eval_output_cpu.h
+@@ -14,4 +14,7 @@
+ #include <opensubdiv/osd/cpuVertexBuffer.h>
+
++#include <array>
++#include <atomic>
++
+ using OpenSubdiv::Far::StencilTable;
+ using OpenSubdiv::Osd::CpuEvaluator;
+@@ -46,4 +49,13 @@ class CpuEvalOutput : public VolatileEvalOutput<CpuVertexBuffer,
+   {
+   }
++
++  ~CpuEvalOutput() override;
++
++  void evalPatches(const PatchCoord *patch_coord, int num_patch_coords, float *P) override;
++
++ private:
++  static constexpr int num_descriptor_types = 11;
++  std::array<std::atomic<int64_t>, num_descriptor_types> position_samples_{};
++  std::array<std::atomic<int64_t>, num_descriptor_types> rust_samples_{};
+ };
+
+diff --git a/source/blender/blenkernel/BKE_subdiv_eval.hh b/source/blender/blenkernel/BKE_subdiv_eval.hh
+index c883e70..32b4208 100644
+--- a/source/blender/blenkernel/BKE_subdiv_eval.hh
++++ b/source/blender/blenkernel/BKE_subdiv_eval.hh
+@@ -54,4 +54,11 @@ void eval_init_displacement(Subdiv *subdiv);
+
+ float3 eval_limit_point(Subdiv *subdiv, int ptex_face_index, float u, float v);
++/** Evaluate the positions for a contiguous part of a regular grid row. */
++void eval_limit_grid_row(Subdiv *subdiv,
++                         int ptex_face_index,
++                         int first_x,
++                         float step,
++                         float v,
++                         MutableSpan<float3> positions);
+ void eval_limit_point_and_derivatives(Subdiv *subdiv,
+                                       int ptex_face_index,
+diff --git a/source/blender/blenkernel/BKE_subdiv_foreach.hh b/source/blender/blenkernel/BKE_subdiv_foreach.hh
+index 1eec6ac..dc7ae92 100644
+--- a/source/blender/blenkernel/BKE_subdiv_foreach.hh
++++ b/source/blender/blenkernel/BKE_subdiv_foreach.hh
+@@ -121,4 +121,11 @@ struct ForeachContext {
+   /** Called exactly once, always corresponds to a single ptex face. */
+   ForeachVertInnerCb vert_inner = nullptr;
++  /** Optional batch over the interior of a quad, in row-major order. */
++  bool (*regular_inner_positions)(const ForeachContext *context,
++                                  void *tls,
++                                  int ptex_face,
++                                  int coarse_face,
++                                  int first_vertex,
++                                  int resolution) = nullptr;
+   /**
+    * Called once for each loose vertex. One loose coarse vertex corresponds
+diff --git a/source/blender/blenkernel/intern/subdiv_eval.cc b/source/blender/blenkernel/intern/subdiv_eval.cc
+index 954170c..be07679 100644
+--- a/source/blender/blenkernel/intern/subdiv_eval.cc
++++ b/source/blender/blenkernel/intern/subdiv_eval.cc
+@@ -10,4 +10,6 @@
+ #include "BKE_subdiv_eval.hh"
+
++#include <algorithm>
++
+ #include "BLI_array_utils.hh"
+ #include "BLI_math_vector.hh"
+@@ -296,4 +298,30 @@ float3 eval_limit_point(Subdiv *subdiv, const int ptex_face_index, const float u
+ }
+
++void eval_limit_grid_row(Subdiv *subdiv,
++                         const int ptex_face_index,
++                         const int first_x,
++                         const float step,
++                         const float v,
++                         const MutableSpan<float3> positions)
++{
++  constexpr int batch_size = 128;
++  for (int64_t begin = 0; begin < positions.size(); begin += batch_size) {
++    const int count = int(std::min<int64_t>(batch_size, positions.size() - begin));
++#ifdef WITH_OPENSUBDIV
++    OpenSubdiv_PatchCoord coordinates[batch_size];
++    for (int index = 0; index < count; index++) {
++      coordinates[index] = {ptex_face_index, int(first_x + begin + index) * step, v};
++    }
++    subdiv->evaluator->eval_output->evaluatePatchesLimit(
++        coordinates, count, positions[begin], nullptr, nullptr);
++#else
++    for (int index = 0; index < count; index++) {
++      positions[begin + index] = eval_limit_point(
++          subdiv, ptex_face_index, int(first_x + begin + index) * step, v);
++    }
++#endif
++  }
++}
++
+ void eval_limit_point_and_derivatives(Subdiv *subdiv,
+                                       const int ptex_face_index,
+diff --git a/source/blender/blenkernel/intern/subdiv_foreach.cc b/source/blender/blenkernel/intern/subdiv_foreach.cc
+index 501027a..7befae8 100644
+--- a/source/blender/blenkernel/intern/subdiv_foreach.cc
++++ b/source/blender/blenkernel/intern/subdiv_foreach.cc
+@@ -585,4 +585,14 @@ static void subdiv_foreach_inner_vertices_regular(ForeachTaskContext *ctx,
+   const int start_vert_index = ctx->subdiv_vert_offset[coarse_face_index];
+   int subdiv_vert_index = ctx->vertices_inner_offset + start_vert_index;
++  if (ctx->foreach_context->regular_inner_positions &&
++      ctx->foreach_context->regular_inner_positions(ctx->foreach_context,
++                                                    tls,
++                                                    ptex_face_index,
++                                                    coarse_face_index,
++                                                    subdiv_vert_index,
++                                                    resolution))
++  {
++    return;
++  }
+   for (int y = 1; y < resolution - 1; y++) {
+     const float v = y * inv_resolution_1;
+diff --git a/source/blender/blenkernel/intern/subdiv_mesh.cc b/source/blender/blenkernel/intern/subdiv_mesh.cc
+index efb86a7..71f90dc 100644
+--- a/source/blender/blenkernel/intern/subdiv_mesh.cc
++++ b/source/blender/blenkernel/intern/subdiv_mesh.cc
+@@ -1136,4 +1136,43 @@ static void subdiv_mesh_vert_inner(const ForeachContext *foreach_context,
+ }
+
++static bool subdiv_mesh_regular_inner_positions(const ForeachContext *foreach_context,
++                                                void *tls_v,
++                                                const int ptex_face_index,
++                                                const int coarse_face_index,
++                                                const int first_vertex,
++                                                const int resolution)
++{
++  SubdivMeshContext *ctx = static_cast<SubdivMeshContext *>(foreach_context->user_data);
++  SubdivMeshTLS *tls = static_cast<SubdivMeshTLS *>(tls_v);
++  const int width = resolution - 2;
++  if (width < 2 || ctx->subdiv->displacement_evaluator) {
++    return false;
++  }
++  const float step = 1.0f / float(resolution - 1);
++  const bool vertex_data = !ctx->coarse_vert_attrs.is_empty() ||
++                           !ctx->coarse_vert_origindex.is_empty() ||
++                           !ctx->coarse_dverts.is_empty();
++  if (vertex_data) {
++    subdiv_mesh_ensure_vert_interpolation(ctx, tls, coarse_face_index, 0);
++  }
++  const IndexRange coarse_face = ctx->coarse_faces[coarse_face_index];
++  for (int y = 1; y <= width; y++) {
++    const float v = y * step;
++    const int row = first_vertex + (y - 1) * width;
++    eval_limit_grid_row(
++        ctx->subdiv, ptex_face_index, 1, step, v, ctx->subdiv_positions.slice(row, width));
++    for (int x = 1; x <= width; x++) {
++      const float u = x * step;
++      const int vertex = row + x - 1;
++      if (vertex_data) {
++        subdiv_vert_data_interpolate(ctx, vertex, tls->vert_interpolation, u, v);
++      }
++      subdiv_mesh_tag_center_vert(coarse_face, vertex, u, v, ctx);
++      subdiv_vert_orco_evaluate(ctx, ptex_face_index, u, v, vertex);
++    }
++  }
++  return true;
++}
++
+ /** \} */
+
+@@ -1490,4 +1529,8 @@ static void setup_foreach_callbacks(const SubdivMeshContext *subdiv_context,
+   foreach_context->vert_edge = subdiv_mesh_vert_edge;
+   foreach_context->vert_inner = subdiv_mesh_vert_inner;
++  static const bool scalar = std::getenv("BLENDER_SUBDIV_EVAL_SCALAR") != nullptr;
++  if (!scalar) {
++    foreach_context->regular_inner_positions = subdiv_mesh_regular_inner_positions;
++  }
+   foreach_context->edge = subdiv_mesh_edge;
+ #ifdef WITH_BLENDER_RUST_SUBDIV_EDGES

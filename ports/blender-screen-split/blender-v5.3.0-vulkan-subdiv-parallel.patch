@@ -1,0 +1,111 @@
+diff --git a/source/blender/draw/intern/draw_cache_impl_subdivision.cc b/source/blender/draw/intern/draw_cache_impl_subdivision.cc
+index e3874956..f3bf7f71 100644
+--- a/source/blender/draw/intern/draw_cache_impl_subdivision.cc
++++ b/source/blender/draw/intern/draw_cache_impl_subdivision.cc
+@@ -8,8 +8,10 @@
+
+ #include "draw_context_private.hh"
+ #include "draw_subdivision.hh"
+
++#include <cstdlib>
++
+ #include "DNA_mesh_types.h"
+ #include "DNA_object_types.h"
+ #include "DNA_scene_types.h"
+
+@@ -32,8 +34,9 @@
+ #include "DRW_render.hh"
+
+ #include "GPU_capabilities.hh"
+ #include "GPU_compute.hh"
++#include "GPU_context.hh"
+ #include "GPU_index_buffer.hh"
+ #include "GPU_state.hh"
+ #include "GPU_uniform_buffer.hh"
+ #include "GPU_vertex_buffer.hh"
+@@ -1592,8 +1595,39 @@ static OpenSubdiv_EvaluatorCache *g_subdiv_evaluator_cache = nullptr;
+ static uint64_t g_subdiv_evaluator_users = 0;
+ /* The evaluator cache is global, so we cannot allow concurrent usage and need synchronization. */
+ static Mutex g_subdiv_eval_mutex;
+
++static void draw_subdiv_compile_requested_shaders(const Mesh &mesh,
++                                                  const int material_count,
++                                                  const bool use_loop_normals,
++                                                  const MeshBufferCache &mbc,
++                                                  const Span<IBOType> ibo_requests,
++                                                  const Span<VBOType> vbo_requests)
++{
++  static const bool serial = std::getenv("BLENDER_RUST_SUBDIV_SERIAL_DRAW_SHADERS") != nullptr;
++  if (serial || GPU_backend_get_type() != GPU_BACKEND_VULKAN || mesh.faces_num == 0) {
++    return;
++  }
++
++  const auto needs_vbo = [&](const VBOType type) {
++    return vbo_requests.contains(type) && !mbc.buff.vbos.contains(type);
++  };
++  if (const bool orco = needs_vbo(VBOType::Orco); orco || needs_vbo(VBOType::Position)) {
++    DRW_shader_subdiv_compile_async(orco ? SubdivShaderType::PATCH_EVALUATION_ORCO :
++                                         SubdivShaderType::PATCH_EVALUATION);
++  }
++  if (needs_vbo(VBOType::CornerNormal) &&
++      !(use_loop_normals && mesh.attributes().contains("custom_normal")))
++  {
++    DRW_shader_subdiv_compile_async(SubdivShaderType::BUFFER_NORMALS_ACCUMULATE);
++    DRW_shader_subdiv_compile_async(SubdivShaderType::BUFFER_LNOR);
++  }
++  if (ibo_requests.contains(IBOType::Tris) && !mbc.buff.ibos.contains(IBOType::Tris)) {
++    DRW_shader_subdiv_compile_async(material_count <= 1 ? SubdivShaderType::BUFFER_TRIS :
++                                                         SubdivShaderType::BUFFER_TRIS_MULTIPLE_MATERIALS);
++  }
++}
++
+ static bool draw_subdiv_create_requested_buffers(Object &ob,
+                                                  Mesh &mesh,
+                                                  MeshBatchCache &batch_cache,
+                                                  MeshBufferCache &mbc,
+@@ -1633,8 +1667,12 @@ static bool draw_subdiv_create_requested_buffers(Object &ob,
+
+   /* Lock the entire evaluation to avoid concurrent usage of shader objects in evaluator cache. */
+   std::scoped_lock lock(g_subdiv_eval_mutex);
+
++  /* Overlap the draw shaders already requested for this mesh with OpenSubdiv setup. */
++  draw_subdiv_compile_requested_shaders(
++      *mesh_eval, batch_cache.mat_len, runtime_data->use_loop_normals, mbc, ibo_requests, vbo_requests);
++
+   if (g_subdiv_evaluator_cache == nullptr) {
+     g_subdiv_evaluator_cache = openSubdiv_createEvaluatorCache(OPENSUBDIV_EVALUATOR_GPU);
+   }
+
+diff --git a/source/blender/draw/intern/draw_shader.cc b/source/blender/draw/intern/draw_shader.cc
+index 5dc0e5a7..8d374955 100644
+--- a/source/blender/draw/intern/draw_shader.cc
++++ b/source/blender/draw/intern/draw_shader.cc
+@@ -253,8 +253,14 @@ gpu::Shader *DRW_shader_subdiv_get(SubdivShaderType shader_type)
+   BLI_assert(!ELEM(shader_type, SubdivShaderType::COMP_CUSTOM_DATA_INTERP));
+   return ShaderCache::get().subdiv_sh[uint(shader_type)].get();
+ }
+
++void DRW_shader_subdiv_compile_async(SubdivShaderType shader_type)
++{
++  BLI_assert(shader_type != SubdivShaderType::COMP_CUSTOM_DATA_INTERP);
++  ShaderCache::get().subdiv_sh[uint(shader_type)].ensure_compile_async();
++}
++
+ gpu::Shader *DRW_shader_subdiv_custom_data_get(GPUVertCompType comp_type, int dimensions)
+ {
+   BLI_assert(dimensions >= 1 && dimensions <= SHADER_CUSTOM_DATA_INTERP_MAX_DIMENSIONS);
+   if (comp_type == GPU_COMP_U16) {
+diff --git a/source/blender/draw/intern/draw_shader.hh b/source/blender/draw/intern/draw_shader.hh
+index dc15e891..b2306967 100644
+--- a/source/blender/draw/intern/draw_shader.hh
++++ b/source/blender/draw/intern/draw_shader.hh
+@@ -57,8 +57,9 @@ enum class SubdivShaderType {
+ };
+ constexpr int SUBDIVISION_MAX_SHADERS = 17;
+
+ gpu::Shader *DRW_shader_subdiv_get(SubdivShaderType shader_type);
++void DRW_shader_subdiv_compile_async(SubdivShaderType shader_type);
+ gpu::Shader *DRW_shader_subdiv_custom_data_get(GPUVertCompType comp_type, int dimensions);
+ gpu::Shader *DRW_shader_subdiv_interp_corner_normals_get();
+
+ void DRW_shaders_free();

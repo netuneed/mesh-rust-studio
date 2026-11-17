@@ -1,0 +1,382 @@
+diff --git a/source/blender/blenlib/BLI_mempool_batch.hh b/source/blender/blenlib/BLI_mempool_batch.hh
+new file mode 100644
+--- /dev/null
++++ b/source/blender/blenlib/BLI_mempool_batch.hh
+@@ -0,0 +1,12 @@
++/* SPDX-FileCopyrightText: 2008 Blender Authors
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later */
++
++#pragma once
++
++namespace blender {
++struct BLI_mempool;
++
++/** Allocate elements in the same order as repeated BLI_mempool_alloc calls. */
++void BLI_mempool_alloc_batch(BLI_mempool *pool, void **elements, unsigned int count);
++}  // namespace blender
+diff --git a/source/blender/blenlib/intern/BLI_mempool.cc b/source/blender/blenlib/intern/BLI_mempool.cc
+--- a/source/blender/blenlib/intern/BLI_mempool.cc
++++ b/source/blender/blenlib/intern/BLI_mempool.cc
+@@ -26,6 +26,7 @@
+ #include "BLI_math_base_c.hh"
+ #include "BLI_mempool.hh"         /* own include */
+ #include "BLI_mempool_bulk_init.hh"
++#include "BLI_mempool_batch.hh"
+ #include "BLI_mempool_private.h" /* own include */
+
+ #if defined(WITH_BLENDER_RUST_BMESH_POOL) && !defined(WITH_ASAN) && !defined(WITH_MEM_VALGRIND)
+@@ -543,6 +544,31 @@
+ #endif
+
+   return static_cast<void *>(free_pop);
++}
++
++void BLI_mempool_alloc_batch(BLI_mempool *pool, void **elements, const uint count)
++{
++#if defined(WITH_ASAN) || defined(WITH_MEM_VALGRIND) || !defined(NDEBUG)
++  for (uint i = 0; i < count; i++) {
++    elements[i] = BLI_mempool_alloc(pool);
++  }
++#else
++  BLI_freenode *free_node = pool->free;
++  for (uint i = 0; i < count; i++) {
++    if (!free_node) [[unlikely]] {
++      pool->free = nullptr;
++      mempool_chunk_add(pool, mempool_chunk_alloc(pool), nullptr);
++      free_node = pool->free;
++    }
++    elements[i] = free_node;
++    if (pool->flag & BLI_MEMPOOL_ALLOW_ITER) {
++      free_node->freeword = USEDWORD;
++    }
++    free_node = free_node->next;
++  }
++  pool->free = free_node;
++  pool->totused += count;
++#endif
+ }
+
+ void *BLI_mempool_calloc(BLI_mempool *pool)
+diff --git a/source/blender/bmesh/CMakeLists.txt b/source/blender/bmesh/CMakeLists.txt
+--- a/source/blender/bmesh/CMakeLists.txt
++++ b/source/blender/bmesh/CMakeLists.txt
+@@ -200,6 +200,8 @@
+ if(BLENDER_RUST_SCREEN_SPLIT_LIB)
+   set_property(SOURCE intern/bmesh_mesh.cc APPEND PROPERTY
+     COMPILE_DEFINITIONS WITH_BLENDER_RUST_BMESH_POOL)
++  set_source_files_properties(intern/bmesh_core.cc intern/bmesh_mesh_convert.cc PROPERTIES
++    COMPILE_DEFINITIONS WITH_BLENDER_RUST_BMESH_QUADS)
+   target_link_libraries(bf_bmesh PRIVATE "${BLENDER_RUST_SCREEN_SPLIT_LIB}")
+ endif()
+
+diff --git a/source/blender/bmesh/intern/bmesh_convert_quad.hh b/source/blender/bmesh/intern/bmesh_convert_quad.hh
+new file mode 100644
+--- /dev/null
++++ b/source/blender/bmesh/intern/bmesh_convert_quad.hh
+@@ -0,0 +1,32 @@
++/* SPDX-FileCopyrightText: 2023 Blender Authors
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later */
++
++#pragma once
++
++#include "BLI_span.hh"
++
++namespace blender {
++struct BMesh;
++struct BMVert;
++struct BMEdge;
++struct BMFace;
++
++#if defined(WITH_BLENDER_RUST_BMESH_QUADS) && defined(NDEBUG) && !defined(WITH_ASAN) && \
++    !defined(WITH_MEM_VALGRIND) && !defined(USE_BMESH_HOLES)
++#  define BMESH_RUST_QUAD_BATCH
++
++constexpr int bm_rust_quad_batch_size = 128;
++
++struct BMeshQuadInput {
++  BMVert *verts[4];
++  BMEdge *edges[4];
++};
++
++/** Allocate faces and loops, then connect the quad and radial cycles in insertion order. */
++void BM_mesh_convert_quad_batch(BMesh &bm,
++                                Span<BMeshQuadInput> input,
++                                MutableSpan<BMFace *> result,
++                                int first_loop_index);
++#endif
++}  // namespace blender
+diff --git a/source/blender/bmesh/intern/bmesh_core.cc b/source/blender/bmesh/intern/bmesh_core.cc
+--- a/source/blender/bmesh/intern/bmesh_core.cc
++++ b/source/blender/bmesh/intern/bmesh_core.cc
+@@ -20,7 +20,13 @@
+ #include "BKE_mesh.hh"
+
+ #include "bmesh.hh"
++#include "bmesh_convert_quad.hh"
+ #include "intern/bmesh_private.hh"
++
++#ifdef BMESH_RUST_QUAD_BATCH
++#  include <cstddef>
++#  include "BLI_mempool_batch.hh"
++#endif
+
+ namespace blender {
+
+@@ -464,12 +470,8 @@
+  *
+  * \note Caller needs to handle customdata.
+  */
+-BLI_INLINE BMFace *bm_face_create__internal(BMesh *bm)
+-{
+-  BMFace *f;
+-
+-  f = static_cast<BMFace *>(BLI_mempool_alloc(bm->fpool));
+-
++BLI_INLINE void bm_face_init(BMesh *bm, BMFace *f)
++{
+   /* --- assign all members --- */
+   f->head.data = nullptr;
+ #ifdef USE_DEBUG_INDEX_MEMCHECK
+@@ -499,19 +501,92 @@
+   f->mat_nr = 0;
+   /* --- done --- */
+
++#ifdef USE_BMESH_HOLES
++  f->totbounds = 0;
++#endif
++}
++
++BLI_INLINE BMFace *bm_face_create__internal(BMesh *bm)
++{
++  BMFace *f = static_cast<BMFace *>(BLI_mempool_alloc(bm->fpool));
++  bm_face_init(bm, f);
++
+   /* may add to middle of the pool */
+   bm->elem_index_dirty |= BM_FACE;
+   bm->elem_table_dirty |= BM_FACE;
+   bm->spacearr_dirty |= BM_SPACEARR_DIRTY_ALL;
+-
+   bm->totface++;
+
+-#ifdef USE_BMESH_HOLES
+-  f->totbounds = 0;
+-#endif
+-
+   return f;
+ }
++
++#ifdef BMESH_RUST_QUAD_BATCH
++/* Shared with bmesh_quads.rs. No allocator or BMesh ownership enters Rust. */
++static_assert(sizeof(void *) == 8);
++static_assert(sizeof(BMHeader) == 16 && alignof(BMHeader) == 8);
++static_assert(offsetof(BMHeader, data) == 0 && offsetof(BMHeader, index) == 8);
++static_assert(offsetof(BMHeader, htype) == 12 && offsetof(BMHeader, hflag) == 13 &&
++              offsetof(BMHeader, api_flag) == 14);
++static_assert(sizeof(BMLoop) == 72 && alignof(BMLoop) == 8);
++static_assert(offsetof(BMLoop, head) == 0 && offsetof(BMLoop, v) == 16 &&
++              offsetof(BMLoop, e) == 24 && offsetof(BMLoop, f) == 32);
++static_assert(offsetof(BMLoop, radial_next) == 40 && offsetof(BMLoop, radial_prev) == 48 &&
++              offsetof(BMLoop, next) == 56 && offsetof(BMLoop, prev) == 64);
++static_assert(sizeof(BMEdge) == 72 && alignof(BMEdge) == 8 && offsetof(BMEdge, l) == 32);
++static_assert(sizeof(BMeshQuadInput) == 64 && alignof(BMeshQuadInput) == 8);
++static_assert(offsetof(BMeshQuadInput, verts) == 0 && offsetof(BMeshQuadInput, edges) == 32);
++static_assert(BM_LOOP == 4);
++
++extern "C" uint8_t blender_rust_bmesh_quad_batch(const BMeshQuadInput *input,
++                                              void *const *faces,
++                                              void *const *loops,
++                                              unsigned int count,
++                                              int first_loop_index);
++
++void BM_mesh_convert_quad_batch(BMesh &bm,
++                                const Span<BMeshQuadInput> input,
++                                const MutableSpan<BMFace *> result,
++                                const int first_loop_index)
++{
++  constexpr int capacity = bm_rust_quad_batch_size;
++  BLI_assert(input.size() > 0 && input.size() <= capacity && result.size() == input.size());
++  const int count = int(input.size());
++  void *faces[capacity];
++  void *loops[capacity * 4];
++  BLI_mempool_alloc_batch(bm.fpool, faces, uint(count));
++  BLI_mempool_alloc_batch(bm.lpool, loops, uint(count * 4));
++  for (int i = 0; i < count; i++) {
++    BMFace *face = static_cast<BMFace *>(faces[i]);
++    bm_face_init(&bm, face);
++    BM_elem_index_set(face, bm.totface + i); /* set_ok */
++    face->len = 4;
++    face->l_first = static_cast<BMLoop *>(loops[i * 4]);
++    zero_v3(face->no);
++    result[i] = face;
++  }
++  if (!blender_rust_bmesh_quad_batch(input.data(), faces, loops, uint(count), first_loop_index)) {
++    /* Rust rejects before changing any element. The pool allocations remain valid. */
++    for (int i = 0; i < count; i++) {
++      BMFace *face = result[i];
++      for (int j = 0; j < 4; j++) {
++        BMLoop *loop = static_cast<BMLoop *>(loops[i * 4 + j]);
++        loop->head = {nullptr, first_loop_index + i * 4 + j, BM_LOOP, 0, 0};
++        loop->v = input[i].verts[j];
++        loop->f = face;
++        loop->e = input[i].edges[j];
++        loop->next = static_cast<BMLoop *>(loops[i * 4 + ((j + 1) % 4)]);
++        loop->prev = static_cast<BMLoop *>(loops[i * 4 + ((j + 3) % 4)]);
++        bmesh_radial_loop_append(input[i].edges[j], loop);
++      }
++    }
++  }
++  bm.totface += count;
++  bm.totloop += count * 4;
++  bm.elem_index_dirty |= BM_FACE | BM_LOOP;
++  bm.elem_table_dirty |= BM_FACE;
++  bm.spacearr_dirty |= BM_SPACEARR_DIRTY_ALL;
++}
++#endif
+
+ BMFace *BM_face_create(BMesh *bm,
+                        BMVert *const *verts,
+diff --git a/source/blender/bmesh/intern/bmesh_mesh_convert.cc b/source/blender/bmesh/intern/bmesh_mesh_convert.cc
+--- a/source/blender/bmesh/intern/bmesh_mesh_convert.cc
++++ b/source/blender/bmesh/intern/bmesh_mesh_convert.cc
+@@ -72,6 +72,7 @@
+  */
+
+ #include <algorithm>
++#include <cstdlib>
+
+ #include "DNA_key_types.h"
+ #include "DNA_mesh_types.h"
+@@ -107,6 +108,7 @@
+ #include "DEG_depsgraph_query.hh"
+
+ #include "bmesh.hh"
++#include "bmesh_convert_quad.hh"
+
+ #include "CLG_log.h"
+
+@@ -138,6 +140,43 @@
+   }
+   return ELEM(name, "position", "uv_seam", "material_index", "sharp_face", "sharp_edge");
+ }
++
++#ifdef BMESH_RUST_QUAD_BATCH
++static bool bm_quad_input(const IndexRange face,
++                          const Span<int> corner_verts,
++                          const Span<int> corner_edges,
++                          const Span<BMVert *> vtable,
++                          const Span<BMEdge *> etable,
++                          BMeshQuadInput &input)
++{
++  if (face.size() != 4 || face.start() < 0 || face.one_after_last() > corner_verts.size() ||
++      face.one_after_last() > corner_edges.size())
++  {
++    return false;
++  }
++  for (int j = 0; j < 4; j++) {
++    const int vi = corner_verts[face.start() + j];
++    const int ei = corner_edges[face.start() + j];
++    if (vi < 0 || vi >= vtable.size() || ei < 0 || ei >= etable.size()) {
++      return false;
++    }
++    input.verts[j] = vtable[vi];
++    input.edges[j] = etable[ei];
++  }
++  for (int j = 0; j < 4; j++) {
++    const BMVert *v = input.verts[j];
++    const BMVert *next = input.verts[(j + 1) % 4];
++    const BMEdge *e = input.edges[j];
++    if (!v || !e || ELEM(v, input.verts[(j + 1) % 4], input.verts[(j + 2) % 4]) ||
++        ELEM(e, input.edges[(j + 1) % 4], input.edges[(j + 2) % 4]) ||
++        !((e->v1 == v && e->v2 == next) || (e->v1 == next && e->v2 == v)))
++    {
++      return false;
++    }
++  }
++  return true;
++}
++#endif
+
+ static BMFace *bm_face_create_from_mpoly(BMesh &bm,
+                                          Span<int> face_verts,
+@@ -626,11 +665,49 @@
+     ftable.reinitialize(mesh->faces_num);
+   }
+
++#ifdef BMESH_RUST_QUAD_BATCH
++  const char *opt_in = std::getenv("BLENDER_RUST_BMESH_QUADS");
++  const bool use_quad_batches = is_new && mesh->faces_num >= 4096 &&
++                                (opt_in && opt_in[0] == '1' && opt_in[1] == '\0');
++  BMeshQuadInput quad_input[bm_rust_quad_batch_size];
++  BMFace *quad_faces[bm_rust_quad_batch_size];
++  int quad_begin = 0;
++  int quad_end = 0;
++  int batch_faces = 0;
++#endif
++
+   int totloops = 0;
+   for (const int i : faces.index_range()) {
+     const IndexRange face = faces[i];
+-    BMFace *f = bm_face_create_from_mpoly(
+-        *bm, corner_verts.slice(face), corner_edges.slice(face), vtable, etable);
++    BMFace *f;
++#ifdef BMESH_RUST_QUAD_BATCH
++    if (use_quad_batches && i >= quad_end) {
++      const int limit = std::min(bm_rust_quad_batch_size, mesh->faces_num - i);
++      int count = 0;
++      while (count < limit &&
++             bm_quad_input(faces[i + count], corner_verts, corner_edges, vtable, etable,
++                           quad_input[count]))
++      {
++        count++;
++      }
++      if (count) {
++        BM_mesh_convert_quad_batch(
++            *bm, {quad_input, count}, {quad_faces, count}, totloops);
++        quad_begin = i;
++        quad_end = i + count;
++        batch_faces += count;
++      }
++    }
++    const bool batched = i < quad_end;
++    if (batched) {
++      f = quad_faces[i - quad_begin];
++    }
++    else
++#endif
++    {
++      f = bm_face_create_from_mpoly(
++          *bm, corner_verts.slice(face), corner_edges.slice(face), vtable, etable);
++    }
+     if (!ftable.is_empty()) {
+       ftable[i] = f;
+     }
+@@ -645,8 +722,13 @@
+       continue;
+     }
+
+-    /* Don't use 'i' since we may have skipped the face. */
+-    BM_elem_index_set(f, bm->totface - 1); /* set_ok */
++#ifdef BMESH_RUST_QUAD_BATCH
++    if (!batched)
++#endif
++    {
++      /* Don't use 'i' since we may have skipped the face. */
++      BM_elem_index_set(f, bm->totface - 1); /* set_ok */
++    }
+
+     /* Transfer flag. */
+     if (!(!sharp_faces.is_empty() && sharp_faces[i])) {
+@@ -701,5 +783,11 @@
+     bm->elem_index_dirty &= ~(BM_FACE | BM_LOOP); /* Added in order, clear dirty flag. */
+   }
+
++#ifdef BMESH_RUST_QUAD_BATCH
++  const char *trace = std::getenv("BLENDER_RUST_BMESH_QUADS_TRACE");
++  if (trace && trace[0] == '1' && trace[1] == '\0') {
++    fprintf(stderr, "RUST_BMESH_QUADS faces=%d mesh_faces=%d\n", batch_faces, mesh->faces_num);
++  }
++#endif
+   subdivision_profile::report("bmesh_faces_with_radial_and_data", profile_faces);
+   bm->uv_select_sync_valid = (need_uv_select && (mesh->flag & ME_FLAG_UV_SELECT_SYNC_VALID)) != 0;

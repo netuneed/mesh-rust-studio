@@ -1,0 +1,64 @@
+diff --git a/source/blender/blenlib/intern/BLI_mempool.cc b/source/blender/blenlib/intern/BLI_mempool.cc
+--- a/source/blender/blenlib/intern/BLI_mempool.cc
++++ b/source/blender/blenlib/intern/BLI_mempool.cc
+@@ -34,6 +34,7 @@
+ #  include <cstdio>
+ #  include <cstdlib>
+
++#  include "BLI_subdivision_profile.hh"
+ #  include "BLI_task.hh"
+ #endif
+
+@@ -368,19 +369,32 @@
+   bool initialized_in_rust[batch_size];
+   const char *trace_value = std::getenv("BLENDER_RUST_BMESH_POOL_TRACE");
+   const bool trace = trace_value && trace_value[0] == '1' && trace_value[1] == '\0';
++  const bool profile = subdivision_profile::enabled();
++  double allocate_ms = 0.0;
++  double initialize_ms = 0.0;
++  double publish_ms = 0.0;
+   uint rust_chunks = 0;
+   BLI_freenode *last_tail = nullptr;
+   const uint esize = pool->esize;
+   for (uint done = 0; done < pool->maxchunks;) {
+     const uint count = std::min(batch_size, pool->maxchunks - done);
++    auto phase = subdivision_profile::start();
+     for (uint i = 0; i < count; i++) {
+       chunks[i] = mempool_chunk_alloc(pool);
++    }
++    if (profile) {
++      allocate_ms += subdivision_profile::elapsed(phase);
++      phase = subdivision_profile::start();
+     }
+     threading::parallel_for(IndexRange(count), 16, [&](const IndexRange range) {
+       for (const int64_t i : range) {
+         initialized_in_rust[i] = mempool_initialize_detached_chunk(pool, chunks[i], init);
+       }
+     });
++    if (profile) {
++      initialize_ms += subdivision_profile::elapsed(phase);
++      phase = subdivision_profile::start();
++    }
+     for (uint i = 0; i < count; i++) {
+       BLI_mempool_chunk *chunk = chunks[i];
+       BLI_freenode *first = CHUNK_DATA(chunk);
+@@ -398,7 +412,19 @@
+           reinterpret_cast<char *>(first) + (pool->pchunk - 1) * esize);
+       rust_chunks += initialized_in_rust[i];
+     }
++    if (profile) {
++      publish_ms += subdivision_profile::elapsed(phase);
++    }
+     done += count;
++  }
++  if (profile) {
++    std::fprintf(stderr,
++                 "BMESH_POOL_PHASE chunks=%u stride=%u alloc_ms=%.6f init_ms=%.6f publish_ms=%.6f\n",
++                 pool->maxchunks,
++                 esize,
++                 allocate_ms,
++                 initialize_ms,
++                 publish_ms);
+   }
+   if (trace) {
+     std::fprintf(stderr,

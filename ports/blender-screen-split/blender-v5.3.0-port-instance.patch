@@ -1,0 +1,86 @@
+diff --git a/intern/ghost/intern/GHOST_SystemWin32.cc b/intern/ghost/intern/GHOST_SystemWin32.cc
+index d2e564b7..144d79c9 100644
+--- a/intern/ghost/intern/GHOST_SystemWin32.cc
++++ b/intern/ghost/intern/GHOST_SystemWin32.cc
+@@ -172,7 +172,17 @@ GHOST_SystemWin32::GHOST_SystemWin32() : has_performance_counter_(false), freq_(
+
+   /* Set App Id for the process so our console will be grouped on the Task Bar. */
+   UTF16_ENCODE(BLENDER_WIN_APPID);
+-  SetCurrentProcessExplicitAppUserModelID(BLENDER_WIN_APPID_16);
++  const wchar_t *app_id = BLENDER_WIN_APPID_16;
++  wchar_t port_instance[8] = {};
++  const DWORD length = GetEnvironmentVariableW(
++      L"BLENDER_RUST_PORT_INSTANCE", port_instance, ARRAYSIZE(port_instance));
++  if (length == 4 && lstrcmpW(port_instance, L"work") == 0) {
++    app_id = L"BlenderFoundation.BlenderRust.Work.5.3";
++  }
++  else if (length == 3 && lstrcmpW(port_instance, L"dev") == 0) {
++    app_id = L"BlenderFoundation.BlenderRust.Dev.5.3";
++  }
++  SetCurrentProcessExplicitAppUserModelID(app_id);
+   UTF16_UN_ENCODE(BLENDER_WIN_APPID);
+
+   /* Check if current keyboard layout uses AltGr and save keylayout ID for
+diff --git a/source/blender/blenkernel/intern/appdir.cc b/source/blender/blenkernel/intern/appdir.cc
+index 423d58b3..6ad5de61 100644
+--- a/source/blender/blenkernel/intern/appdir.cc
++++ b/source/blender/blenkernel/intern/appdir.cc
+@@ -203,10 +203,26 @@ bool BKE_appdir_folder_documents(char *dir)
+   return true;
+ }
+
++static const char *port_runtime_directory(const char *name, const size_t capacity)
++{
++  const char *directory = BLI_getenv(name);
++  if (directory && BLI_path_is_abs_from_cwd(directory) && strlen(directory) + 2 <= capacity &&
++      BLI_is_dir(directory))
++  {
++    return directory;
++  }
++  return nullptr;
++}
++
+ void BKE_appdir_folder_caches(char *path, const size_t path_maxncpy)
+ {
+   path[0] = '\0';
+
++  if (const char *directory = port_runtime_directory("BLENDER_RUST_PORT_CACHE_DIR", path_maxncpy)) {
++    BLI_path_join(path, path_maxncpy, directory, SEP_STR);
++    return;
++  }
++
+   const GHOST_ISystemPaths *ghost_system_paths = GHOST_ISystemPaths::get();
+   std::optional<std::string> caches_root_path = ghost_system_paths->getUserSpecialDir(
+       GHOST_kUserSpecialDirCaches);
+@@ -1254,6 +1270,12 @@ void BKE_tempdir_init(const char *userdir)
+
+   g_app.temp_dirname_session_can_be_deleted = false;
+
++  if (const char *directory = port_runtime_directory("BLENDER_RUST_PORT_TEMP_DIR",
++                                                      sizeof(g_app.temp_dirname_base)))
++  {
++    userdir = directory;
++  }
++
+   /* Only do one pass if `userdir` is null. */
+   int userdir_args_num = userdir ? 2 : 1;
+   const char *userdir_args[2] = {userdir, nullptr};
+diff --git a/source/blender/windowmanager/intern/wm_window.cc b/source/blender/windowmanager/intern/wm_window.cc
+index 998c58a9..80772e85 100644
+--- a/source/blender/windowmanager/intern/wm_window.cc
++++ b/source/blender/windowmanager/intern/wm_window.cc
+@@ -693,6 +693,14 @@ static void wm_window_title_text(wmWindowManager *wm,
+
+   win_title.append(StringRef(" — Blender "));
+   win_title.append(StringRef(BKE_blender_version_string()));
++  if (const char *instance = BLI_getenv("BLENDER_RUST_PORT_INSTANCE")) {
++    if (STREQ(instance, "work")) {
++      win_title.append(StringRef(" [Rust]"));
++    }
++    else if (STREQ(instance, "dev")) {
++      win_title.append(StringRef(" [Rust Dev]"));
++    }
++  }
+ }
+
+ static void wm_window_title_state_refresh(wmWindowManager *wm, wmWindow *win)

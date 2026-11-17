@@ -1,0 +1,289 @@
+diff --git a/intern/opensubdiv/internal/evaluator/gpu_patch_table.hh b/intern/opensubdiv/internal/evaluator/gpu_patch_table.hh
+--- a/intern/opensubdiv/internal/evaluator/gpu_patch_table.hh
++++ b/intern/opensubdiv/internal/evaluator/gpu_patch_table.hh
+@@ -29,6 +29,10 @@
+   {
+     return _patchArrays;
+   }
++
++  /** Buffer owned by this patch table, shared across draw requests. */
++  gpu::StorageBuf *GetPatchArrayBuffer();
++  gpu::StorageBuf *GetFVarPatchArrayBuffer(int fvarChannel);
+
+   /// Returns the GL index buffer containing the patch control vertices
+   gpu::StorageBuf *GetPatchIndexBuffer() const
+@@ -85,6 +89,7 @@
+   bool allocate(PatchTable const *farPatchTable);
+
+   PatchArrayVector _patchArrays;
++  gpu::StorageBuf *_patchArrayBuffer = nullptr;
+
+   gpu::StorageBuf *_patchIndexBuffer = nullptr;
+   gpu::StorageBuf *_patchParamBuffer = nullptr;
+@@ -93,6 +98,7 @@
+   gpu::StorageBuf *_varyingIndexBuffer = nullptr;
+
+   std::vector<PatchArrayVector> _fvarPatchArrays;
++  std::vector<gpu::StorageBuf *> _fvarPatchArrayBuffers;
+   std::vector<gpu::StorageBuf *> _fvarIndexBuffers;
+   std::vector<gpu::StorageBuf *> _fvarParamBuffers;
+ };
+diff --git a/intern/opensubdiv/internal/evaluator/gpu_patch_table.cc b/intern/opensubdiv/internal/evaluator/gpu_patch_table.cc
+--- a/intern/opensubdiv/internal/evaluator/gpu_patch_table.cc
++++ b/intern/opensubdiv/internal/evaluator/gpu_patch_table.cc
+@@ -3,6 +3,8 @@
+  * SPDX-License-Identifier: GPL-2.0-or-later */
+
+ #include "gpu_patch_table.hh"
++
++#include "BLI_subdivision_profile.hh"
+
+ #include "opensubdiv/far/patchTable.h"
+ #include "opensubdiv/osd/cpuPatchTable.h"
+@@ -34,17 +36,42 @@
+   while (!buffers.empty()) {
+     gpu::StorageBuf *buffer = buffers.back();
+     buffers.pop_back();
+-    GPU_storagebuf_free(buffer);
++    discard_buffer(&buffer);
+   }
+ }
+
+ GPUPatchTable::~GPUPatchTable()
+ {
++  discard_buffer(&_patchArrayBuffer);
+   discard_buffer(&_patchIndexBuffer);
+   discard_buffer(&_patchParamBuffer);
+   discard_buffer(&_varyingIndexBuffer);
++  discard_list(_fvarPatchArrayBuffers);
+   discard_list(_fvarIndexBuffers);
+   discard_list(_fvarParamBuffers);
++}
++
++static gpu::StorageBuf *ensure_patch_array_buffer(gpu::StorageBuf *&buffer,
++                                                  const PatchArrayVector &arrays)
++{
++  if (buffer == nullptr) {
++    const auto begin = subdivision_profile::start();
++    buffer = GPU_storagebuf_create_ex(
++        arrays.size() * sizeof(PatchArray), arrays.data(), GPU_USAGE_STATIC, "osd_patch_array");
++    subdivision_profile::report("osd_gpu_patch_array_create", begin);
++  }
++  return buffer;
++}
++
++gpu::StorageBuf *GPUPatchTable::GetPatchArrayBuffer()
++{
++  return ensure_patch_array_buffer(_patchArrayBuffer, _patchArrays);
++}
++
++gpu::StorageBuf *GPUPatchTable::GetFVarPatchArrayBuffer(const int fvarChannel)
++{
++  return ensure_patch_array_buffer(_fvarPatchArrayBuffers[fvarChannel],
++                                   _fvarPatchArrays[fvarChannel]);
+ }
+
+ bool GPUPatchTable::allocate(PatchTable const *far_patch_table)
+@@ -85,6 +112,7 @@
+   /* Face varying */
+   const int num_face_varying_channels = patch_table.GetNumFVarChannels();
+   _fvarPatchArrays.resize(num_face_varying_channels);
++  _fvarPatchArrayBuffers.resize(num_face_varying_channels);
+   _fvarIndexBuffers.resize(num_face_varying_channels);
+   _fvarParamBuffers.resize(num_face_varying_channels);
+   for (int index = 0; index < num_face_varying_channels; index++) {
+diff --git a/intern/opensubdiv/internal/evaluator/eval_output_gpu.cc b/intern/opensubdiv/internal/evaluator/eval_output_gpu.cc
+--- a/intern/opensubdiv/internal/evaluator/eval_output_gpu.cc
++++ b/intern/opensubdiv/internal/evaluator/eval_output_gpu.cc
+@@ -10,19 +10,7 @@
+
+ #include "gpu_patch_table.hh"
+
+-using OpenSubdiv::Osd::PatchArray;
+-using OpenSubdiv::Osd::PatchArrayVector;
+-
+ namespace blender::opensubdiv {
+-
+-static gpu::StorageBuf *create_patch_array_buffer(const PatchArrayVector &patch_arrays)
+-{
+-  const size_t patch_array_size = sizeof(PatchArray);
+-  const size_t patch_array_byte_size = patch_array_size * patch_arrays.size();
+-  gpu::StorageBuf *storage_buf = GPU_storagebuf_create_ex(
+-      patch_array_byte_size, patch_arrays.data(), GPU_USAGE_STATIC, "osd_patch_array");
+-  return storage_buf;
+-}
+
+ GpuEvalOutput::GpuEvalOutput(const StencilTable *vertex_stencils,
+                              const StencilTable *varying_stencils,
+@@ -43,16 +31,15 @@
+ {
+ }
+
+-gpu::StorageBuf *GpuEvalOutput::create_patch_arrays_buf()
++gpu::StorageBuf *GpuEvalOutput::get_patch_arrays_buf()
+ {
+-  GPUPatchTable *patch_table = getPatchTable();
+-  return create_patch_array_buffer(patch_table->GetPatchArrays());
++  return getPatchTable()->GetPatchArrayBuffer();
+ }
+
+-gpu::StorageBuf *GpuEvalOutput::create_face_varying_patch_array_buf(const int face_varying_channel)
++gpu::StorageBuf *GpuEvalOutput::get_face_varying_patch_array_buf(const int face_varying_channel)
+ {
+   GPUPatchTable *patch_table = getFVarPatchTable(face_varying_channel);
+-  return create_patch_array_buffer(patch_table->GetFVarPatchArrays(face_varying_channel));
++  return patch_table->GetFVarPatchArrayBuffer(face_varying_channel);
+ }
+
+ }  // namespace blender::opensubdiv
+diff --git a/intern/opensubdiv/internal/evaluator/eval_output.h b/intern/opensubdiv/internal/evaluator/eval_output.h
+--- a/intern/opensubdiv/internal/evaluator/eval_output.h
++++ b/intern/opensubdiv/internal/evaluator/eval_output.h
+@@ -76,7 +76,7 @@
+   // data structure. They need to be overridden in the specific instances of the EvalOutput derived
+   // classes if needed, while the interfaces above are overridden through VolatileEvalOutput.
+
+-  virtual gpu::StorageBuf *create_patch_arrays_buf()
++  virtual gpu::StorageBuf *get_patch_arrays_buf()
+   {
+     return nullptr;
+   }
+@@ -101,7 +101,7 @@
+     return nullptr;
+   }
+
+-  virtual gpu::StorageBuf *create_face_varying_patch_array_buf(const int /*face_varying_channel*/)
++  virtual gpu::StorageBuf *get_face_varying_patch_array_buf(const int /*face_varying_channel*/)
+   {
+     return nullptr;
+   }
+diff --git a/intern/opensubdiv/internal/evaluator/eval_output_gpu.h b/intern/opensubdiv/internal/evaluator/eval_output_gpu.h
+--- a/intern/opensubdiv/internal/evaluator/eval_output_gpu.h
++++ b/intern/opensubdiv/internal/evaluator/eval_output_gpu.h
+@@ -31,7 +31,7 @@
+                 const PatchTable *patch_table,
+                 EvaluatorCache *evaluator_cache = nullptr);
+
+-  gpu::StorageBuf *create_patch_arrays_buf() override;
++  gpu::StorageBuf *get_patch_arrays_buf() override;
+
+   gpu::StorageBuf *get_patch_index_buf() override
+   {
+@@ -53,7 +53,7 @@
+     return getSrcVertexDataBuffer()->get_vertex_buffer();
+   }
+
+-  gpu::StorageBuf *create_face_varying_patch_array_buf(const int face_varying_channel) override;
++  gpu::StorageBuf *get_face_varying_patch_array_buf(const int face_varying_channel) override;
+
+   gpu::StorageBuf *get_face_varying_patch_index_buf(const int face_varying_channel) override
+   {
+diff --git a/intern/opensubdiv/internal/evaluator/evaluator_impl.cc b/intern/opensubdiv/internal/evaluator/evaluator_impl.cc
+--- a/intern/opensubdiv/internal/evaluator/evaluator_impl.cc
++++ b/intern/opensubdiv/internal/evaluator/evaluator_impl.cc
+@@ -362,9 +362,9 @@
+   memcpy(buffer_nodes.data(), quadtree.data(), sizeof(PatchMap::QuadNode) * quadtree.size());
+ }
+
+-gpu::StorageBuf *EvalOutputAPI::create_patch_arrays_buf()
+-{
+-  return implementation_->create_patch_arrays_buf();
++gpu::StorageBuf *EvalOutputAPI::get_patch_arrays_buf()
++{
++  return implementation_->get_patch_arrays_buf();
+ }
+
+ gpu::StorageBuf *EvalOutputAPI::get_patch_index_buf()
+@@ -387,9 +387,9 @@
+   return implementation_->get_source_data_buf();
+ }
+
+-gpu::StorageBuf *EvalOutputAPI::create_face_varying_patch_array_buf(const int face_varying_channel)
+-{
+-  return implementation_->create_face_varying_patch_array_buf(face_varying_channel);
++gpu::StorageBuf *EvalOutputAPI::get_face_varying_patch_array_buf(const int face_varying_channel)
++{
++  return implementation_->get_face_varying_patch_array_buf(face_varying_channel);
+ }
+
+ gpu::StorageBuf *EvalOutputAPI::get_face_varying_patch_index_buf(const int face_varying_channel)
+diff --git a/intern/opensubdiv/opensubdiv_evaluator.hh b/intern/opensubdiv/opensubdiv_evaluator.hh
+--- a/intern/opensubdiv/opensubdiv_evaluator.hh
++++ b/intern/opensubdiv/opensubdiv_evaluator.hh
+@@ -144,8 +144,8 @@
+                    int *max_depth,
+                    int *patches_are_triangular);
+
+-  // Copy the patch arrays buffer used by OpenSubDiv for the source data to the given buffer.
+-  gpu::StorageBuf *create_patch_arrays_buf();
++  // Borrow the evaluator-owned patch array buffer for the source data.
++  gpu::StorageBuf *get_patch_arrays_buf();
+
+   // Wrap the patch index buffer used by OpenSubDiv for the source data with the given buffer.
+   gpu::StorageBuf *get_patch_index_buf();
+@@ -159,9 +159,8 @@
+   // Wrap the buffer used by OpenSubDiv for the extra source data with the given buffer.
+   gpu::VertBuf *get_source_data_buf();
+
+-  // Copy the patch arrays buffer used by OpenSubDiv for the face varying channel with the given
+-  // buffer.
+-  gpu::StorageBuf *create_face_varying_patch_array_buf(const int face_varying_channel);
++  // Borrow the evaluator-owned patch array buffer for the face varying channel.
++  gpu::StorageBuf *get_face_varying_patch_array_buf(const int face_varying_channel);
+
+   // Wrap the patch index buffer used by OpenSubDiv for the face varying channel with the given
+   // buffer.
+diff --git a/source/blender/draw/intern/draw_cache_impl_subdivision.cc b/source/blender/draw/intern/draw_cache_impl_subdivision.cc
+--- a/source/blender/draw/intern/draw_cache_impl_subdivision.cc
++++ b/source/blender/draw/intern/draw_cache_impl_subdivision.cc
+@@ -1002,7 +1002,7 @@
+     src_extra_buffer = evaluator->eval_output->get_source_data_buf();
+   }
+
+-  gpu::StorageBuf *patch_arrays_buffer = evaluator->eval_output->create_patch_arrays_buf();
++  gpu::StorageBuf *patch_arrays_buffer = evaluator->eval_output->get_patch_arrays_buf();
+   gpu::StorageBuf *patch_index_buffer = evaluator->eval_output->get_patch_index_buf();
+   gpu::StorageBuf *patch_param_buffer = evaluator->eval_output->get_patch_param_buf();
+
+@@ -1036,7 +1036,6 @@
+   /* Cleanup. */
+   GPU_shader_unbind();
+
+-  GPU_storagebuf_free(patch_arrays_buffer);
+ #else
+   UNUSED_VARS(cache, pos, orco);
+ #endif
+@@ -1062,7 +1061,7 @@
+       face_varying_channel);
+
+   gpu::StorageBuf *patch_arrays_buffer =
+-      evaluator->eval_output->create_face_varying_patch_array_buf(face_varying_channel);
++      evaluator->eval_output->get_face_varying_patch_array_buf(face_varying_channel);
+   gpu::StorageBuf *patch_index_buffer = evaluator->eval_output->get_face_varying_patch_index_buf(
+       face_varying_channel);
+   gpu::StorageBuf *patch_param_buffer = evaluator->eval_output->get_face_varying_patch_param_buf(
+@@ -1095,7 +1094,6 @@
+   /* Cleanup. */
+   GPU_shader_unbind();
+
+-  GPU_storagebuf_free(patch_arrays_buffer);
+ #else
+   UNUSED_VARS(cache, uvs, face_varying_channel, dst_offset);
+ #endif
+@@ -1268,7 +1266,7 @@
+   OpenSubdiv_Evaluator *evaluator = subdiv->evaluator;
+
+   gpu::VertBuf *src_buffer = evaluator->eval_output->get_source_buf();
+-  gpu::StorageBuf *patch_arrays_buffer = evaluator->eval_output->create_patch_arrays_buf();
++  gpu::StorageBuf *patch_arrays_buffer = evaluator->eval_output->get_patch_arrays_buf();
+   gpu::StorageBuf *patch_index_buffer = evaluator->eval_output->get_patch_index_buf();
+   gpu::StorageBuf *patch_param_buffer = evaluator->eval_output->get_patch_param_buf();
+
+@@ -1306,7 +1304,6 @@
+   /* Cleanup. */
+   GPU_shader_unbind();
+
+-  GPU_storagebuf_free(patch_arrays_buffer);
+ #else
+   UNUSED_VARS(cache, fdots_pos, fdots_nor, fdots_indices);
+ #endif
