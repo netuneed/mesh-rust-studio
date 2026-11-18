@@ -4,6 +4,23 @@
 
 Mesh Rust Studio is an independent project based on Blender 5.3 for Windows x64 with Rust implementations for selected operations and extra modeling tools. It uses Blender's `.blend` format, interface and Python API.
 
+## What has improved
+
+Work includes Auto UV, QuadriFlow and mesh simplification. First-run setup imports selected settings and links existing asset and extension folders. Work and Dev use separate profiles.
+
+| Benchmark | Before → After | Change |
+| --- | ---: | --- |
+| First Vulkan frame, warm launch | 1.46 s → 1.15 s (−21%) | Direct launcher removes an extra process |
+| Smart UV Project, 81,920 faces | 466 ms → 154 ms (−67%) | Reuses projection comparisons |
+| Enter Edit Mode, 1.57M faces | 1,350 ms → 820 ms (−39%) | Faster mesh conversion and pool setup |
+| Undo, same mesh | 1,306 ms → 605 ms (−54%) | Faster restoration of edit geometry |
+
+Local Windows benchmark medians. Launch and Smart UV compare earlier project builds. Edit Mode and Undo compare with Blender 5.3.0 under the same test conditions.
+
+**Next**. Cut pauses when editing Subdivision and shared Boolean stacks. Rebuild and test the Work and Dev downloads after updating embedded dependencies.
+
+**Security status**. The public release contains sources. Windows builds are pending fixes for embedded FFmpeg 8.1 (CVE-2026-8461) and updates to Python and HTTP dependencies. [Security policy](SECURITY.md) · [FFmpeg advisory list](https://ffmpeg.org/security.html)
+
 ## Download
 
 **Release status**. Windows builds are pending updates to bundled dependencies.
