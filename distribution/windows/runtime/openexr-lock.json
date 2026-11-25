@@ -1,0 +1,10 @@
+{
+  "openexr-3.4.19.tar.gz": {
+    "url": "https://github.com/AcademySoftwareFoundation/openexr/releases/download/v3.4.19/openexr-3.4.19.tar.gz",
+    "sha256": "6e9fd3de716a72382622867d9a46c7202cf62d8374efd02300a0c022cafebc56"
+  },
+  "openexr-3.4.19.tar.gz.sigstore.json": {
+    "url": "https://github.com/AcademySoftwareFoundation/openexr/releases/download/v3.4.19/openexr-3.4.19.tar.gz.sigstore.json",
+    "sha256": "90a47737807d92dc9c8632a943a9976352f1f12dc5ee0cc06604ac33d095d6f5"
+  }
+}

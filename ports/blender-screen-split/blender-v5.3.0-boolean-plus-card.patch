@@ -1,0 +1,33 @@
+diff --git a/source/blender/modifiers/intern/MOD_nodes.cc b/source/blender/modifiers/intern/MOD_nodes.cc
+--- a/source/blender/modifiers/intern/MOD_nodes.cc
++++ b/source/blender/modifiers/intern/MOD_nodes.cc
+@@ -1940,6 +1940,15 @@
+ {
+   ui::Layout &layout = *panel->layout;
+   PointerRNA *modifier_ptr = modifier_panel_get_property_pointers(panel, nullptr);
++  const auto *nmd = static_cast<const NodesModifierData *>(modifier_ptr->data);
++  const IDProperty *properties = nmd->node_group ? nmd->node_group->id.properties : nullptr;
++  if (properties && IDP_GetPropertyFromGroup(properties, "boolean_plus_operation") &&
++      WM_menutype_find("OBJECT_MT_boolean_plus_card", true))
++  {
++    layout.context_ptr_set("boolean_plus_modifier", modifier_ptr);
++    layout.menu_contents("OBJECT_MT_boolean_plus_card");
++    return;
++  }
+   nodes::draw_geometry_nodes_modifier_ui(*C, modifier_ptr, layout);
+ }
+ 
+diff --git a/source/blender/editors/object/add_modifier_assets.cc b/source/blender/editors/object/add_modifier_assets.cc
+--- a/source/blender/editors/object/add_modifier_assets.cc
++++ b/source/blender/editors/object/add_modifier_assets.cc
+@@ -231,6 +231,10 @@
+     }
+     if (ELEM(object->type, OB_MESH)) {
+       menus.add_new("Normals");
++      if (WM_menutype_find("OBJECT_MT_modifier_add_blender_plus", true)) {
++        /* The Work menu also draws this catalog's assets. */
++        menus.add_new("Blender+ RUST");
++      }
+     }
+     if (ELEM(object->type, OB_MESH, OB_CURVES_LEGACY, OB_FONT, OB_SURF, OB_LATTICE)) {
+       menus.add_new("Physics");

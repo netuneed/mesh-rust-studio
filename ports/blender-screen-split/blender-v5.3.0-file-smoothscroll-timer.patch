@@ -1,0 +1,24 @@
+diff --git a/source/blender/editors/space_file/file_ops.cc b/source/blender/editors/space_file/file_ops.cc
+--- a/source/blender/editors/space_file/file_ops.cc
++++ b/source/blender/editors/space_file/file_ops.cc
+@@ -2443,7 +2443,6 @@ static wmOperatorStatus file_smoothscroll_invoke(bContext *C,
+   ScrArea *area = CTX_wm_area(C);
+   SpaceFile *sfile = CTX_wm_space_file(C);
+   ARegion *region, *region_ctx = CTX_wm_region(C);
+-  const bool is_horizontal = (sfile->layout->flag & FILE_LAYOUT_HOR) != 0;
+   int i;
+ 
+   /* escape if not our timer */
+@@ -2450,7 +2449,12 @@ static wmOperatorStatus file_smoothscroll_invoke(bContext *C,
+   if (sfile->smoothscroll_timer == nullptr || sfile->smoothscroll_timer != event->customdata) {
+     return OPERATOR_PASS_THROUGH;
+   }
++  /* The browser may receive timer events before its first layout. */
++  if (sfile->files == nullptr || sfile->layout == nullptr) {
++    return OPERATOR_PASS_THROUGH;
++  }
+ 
++  const bool is_horizontal = (sfile->layout->flag & FILE_LAYOUT_HOR) != 0;
+   const int numfiles = filelist_files_ensure(sfile->files);
+ 
+   /* Due to asynchronous nature of file listing, we may execute this code before `file_refresh()`

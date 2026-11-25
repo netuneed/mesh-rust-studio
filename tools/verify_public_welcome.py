@@ -48,7 +48,9 @@ def check_import(bpy, output):
     _, source, _ = fixture_paths(output)
     assert welcome._latest_profile() == str(source)
     assert welcome._local_path(r"\\invalid.test\remote\asset") is None
-    welcome.register()
+    already_registered = hasattr(bpy.types, "BLENDER_RUST_OT_setup")
+    if not already_registered:
+        welcome.register()
     for menu in (bpy.types.WM_MT_splash_quick_setup, bpy.types.WM_MT_splash):
         assert welcome._draw_setup in menu._dyn_ui_initialize()
     assert bpy.ops.blender_rust.default_apps.poll()
@@ -84,7 +86,8 @@ def check_import(bpy, output):
             raise AssertionError("Invalid preferences accepted")
         assert preferences.inputs.mouse_double_click_time == 371
 
-    welcome.unregister()
+    if not already_registered:
+        welcome.unregister()
     print("PUBLIC_WELCOME_VERIFIED")
 
 

@@ -1,0 +1,132 @@
+{
+  "as_of": "2026-11-25",
+  "scope": "Top-level distributions with installed metadata in the Windows runtime. Vendor-internal private dependency copies are outside this inventory.",
+  "distributions": [
+    {
+      "name": "attrs",
+      "version": "25.3.0",
+      "source": "https://pypi.org/pypi/attrs/25.3.0/json",
+      "open_advisories": []
+    },
+    {
+      "name": "autopep8",
+      "version": "2.3.1",
+      "source": "https://pypi.org/pypi/autopep8/2.3.1/json",
+      "open_advisories": []
+    },
+    {
+      "name": "cattrs",
+      "version": "25.1.1",
+      "source": "https://pypi.org/pypi/cattrs/25.1.1/json",
+      "open_advisories": []
+    },
+    {
+      "name": "certifi",
+      "version": "2026.11.20",
+      "source": "https://pypi.org/pypi/certifi/2026.11.20/json",
+      "open_advisories": []
+    },
+    {
+      "name": "charset-normalizer",
+      "version": "3.5.3",
+      "source": "https://pypi.org/pypi/charset-normalizer/3.5.3/json",
+      "open_advisories": []
+    },
+    {
+      "name": "Cython",
+      "version": "3.0.11",
+      "source": "https://pypi.org/pypi/Cython/3.0.11/json",
+      "open_advisories": []
+    },
+    {
+      "name": "docutils",
+      "version": "0.22.4",
+      "source": "https://pypi.org/pypi/docutils/0.22.4/json",
+      "open_advisories": []
+    },
+    {
+      "name": "idna",
+      "version": "3.20",
+      "source": "https://pypi.org/pypi/idna/3.20/json",
+      "open_advisories": []
+    },
+    {
+      "name": "meson",
+      "version": "1.9.0",
+      "source": "https://pypi.org/pypi/meson/1.9.0/json",
+      "open_advisories": []
+    },
+    {
+      "name": "meson-python",
+      "version": "0.18.0",
+      "source": "https://pypi.org/pypi/meson-python/0.18.0/json",
+      "open_advisories": []
+    },
+    {
+      "name": "numpy",
+      "version": "2.3.4",
+      "source": "https://pypi.org/pypi/numpy/2.3.4/json",
+      "open_advisories": []
+    },
+    {
+      "name": "packaging",
+      "version": "25.0",
+      "source": "https://pypi.org/pypi/packaging/25.0/json",
+      "open_advisories": []
+    },
+    {
+      "name": "pip",
+      "version": "26.3",
+      "source": "https://pypi.org/pypi/pip/26.3/json",
+      "open_advisories": []
+    },
+    {
+      "name": "pycodestyle",
+      "version": "2.13.0",
+      "source": "https://pypi.org/pypi/pycodestyle/2.13.0/json",
+      "open_advisories": []
+    },
+    {
+      "name": "pyproject-metadata",
+      "version": "0.9.1",
+      "source": "https://pypi.org/pypi/pyproject-metadata/0.9.1/json",
+      "open_advisories": []
+    },
+    {
+      "name": "requests",
+      "version": "2.34.2",
+      "source": "https://pypi.org/pypi/requests/2.34.2/json",
+      "open_advisories": []
+    },
+    {
+      "name": "setuptools",
+      "version": "84.2.1",
+      "source": "https://pypi.org/pypi/setuptools/84.2.1/json",
+      "open_advisories": []
+    },
+    {
+      "name": "tomli_w",
+      "version": "1.2.0",
+      "source": "https://pypi.org/pypi/tomli_w/1.2.0/json",
+      "open_advisories": []
+    },
+    {
+      "name": "typing_extensions",
+      "version": "4.14.1",
+      "source": "https://pypi.org/pypi/typing_extensions/4.14.1/json",
+      "open_advisories": []
+    },
+    {
+      "name": "urllib3",
+      "version": "2.8.0",
+      "source": "https://pypi.org/pypi/urllib3/2.8.0/json",
+      "open_advisories": []
+    },
+    {
+      "name": "zstandard",
+      "version": "0.25.0",
+      "source": "https://pypi.org/pypi/zstandard/0.25.0/json",
+      "open_advisories": []
+    }
+  ]
+}

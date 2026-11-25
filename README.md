@@ -6,7 +6,7 @@ Mesh Rust Studio is an independent project based on Blender 5.3 for Windows x64 
 
 ## What has improved
 
-Work includes Auto UV, QuadriFlow and mesh simplification. First-run setup imports selected settings and links existing asset and extension folders. Work and Dev use separate profiles.
+Work includes Boolean Plus, Auto UV, QuadriFlow and mesh simplification. First-run setup imports selected settings and links existing asset and extension folders. Work and Dev use separate profiles.
 
 | Benchmark | Before → After | Change |
 | --- | ---: | --- |
@@ -17,28 +17,26 @@ Work includes Auto UV, QuadriFlow and mesh simplification. First-run setup impor
 
 Local Windows benchmark medians. Launch and Smart UV compare earlier project builds. Edit Mode and Undo compare with Blender 5.3.0 under the same test conditions.
 
-**Next**. Cut pauses when editing Subdivision and shared Boolean stacks. Rebuild and test the Work and Dev downloads after updating embedded dependencies.
+## Windows download
 
-**Security status**. The public release contains sources. Windows builds are pending fixes for embedded FFmpeg 8.1 (CVE-2026-8461) and updates to Python and HTTP dependencies. [Security policy](SECURITY.md) · [FFmpeg advisory list](https://ffmpeg.org/security.html)
+Work 0.12 runs on Windows x64. Extract the entire ZIP, then open **Mesh Rust Studio.exe**. It uses its own profile under `%LOCALAPPDATA%\MeshRustStudio\work`. [Download Work for Windows x64](https://github.com/netuneed/mesh-rust-studio/releases/download/v0.12.0-work/MeshRustStudio-Work-0.12-Windows-x64.zip) · [Checksums and source files](https://github.com/netuneed/mesh-rust-studio/releases/tag/v0.12.0-work)
 
-## Download
-
-**Release status**. Windows builds are pending updates to bundled dependencies.
-
-Open [GitHub Releases](https://github.com/netuneed/mesh-rust-studio/releases). A channel is ready to install when its ZIP and checksums appear under **Assets** on a published release.
-
-| Edition | ZIP | Choose it for |
-| --- | --- | --- |
-| Work | `MeshRustStudio-Work-Windows-x64.zip` | Daily modeling, Auto UV, QuadriFlow and mesh simplification |
-| Dev | `MeshRustStudio-Dev-Windows-x64.zip` | Trying development builds in a separate profile |
-
-Use a 64-bit Windows PC with an x64 processor and a GPU driver supported by Blender. See the release notes for tested versions and enabled GPU features. [Blender system requirements](https://www.blender.org/download/requirements/)
-
-To verify the download, run this command in PowerShell from the download folder and compare the result with the SHA-256 shown on that release. For Dev, substitute its ZIP name.
+To verify the download, compare the result of this PowerShell command with the matching entry in `SHA256SUMS.txt`.
 
 ```powershell
-Get-FileHash -Algorithm SHA256 .\MeshRustStudio-Work-Windows-x64.zip
+Get-FileHash -Algorithm SHA256 .\MeshRustStudio-Work-0.12-Windows-x64.zip
 ```
+
+## Boolean Plus
+
+1. Select the mesh you want to modify. Open **Properties > Modifiers > Add Modifier > Blender Plus > Boolean Plus**.
+2. Use the **Cutter** eyedropper to pick the other mesh. Choose **Difference**, **Union** or **Intersection**.
+3. Use **Solver > Exact** when you want the exact solver. **Auto** can use the manifold solver on suitable operands. **Cutter Display** changes the cutter's viewport display.
+4. Expand **Tools** for the preview and apply controls. Older saved Boolean Plus modifiers expose **Enable Editable Controls** to upgrade the selected modifier.
+
+![Boolean Plus modifier with Difference selected and a wireframe cutter](docs/boolean-plus.png)
+
+Work 0.12 also fixes a file browser timer crash that could occur while switching viewport orientation with a collapsed Asset Browser. Existing scenes can use the same navigation gizmo and Exact Boolean workflow.
 
 ## First launch
 
@@ -62,8 +60,8 @@ Try Dev on a copy of an important project. Check the release notes for any Blend
 
 ## Source and support
 
-The code is based on [Blender 5.3.0](https://github.com/blender/blender/tree/02f0899d78e374b63e7181d9061e1f7ab03419cc). The release page will carry the matching source and build instructions alongside the binaries. Blender and bundled components retain their licenses. [Blender license](https://docs.blender.org/manual/en/5.3/getting_started/about/license.html)
+The code is based on [Blender 5.3.0](https://github.com/blender/blender/tree/02f0899d78e374b63e7181d9061e1f7ab03419cc). The release includes the matching source and build instructions. Blender and bundled components retain their licenses. [Blender license](https://docs.blender.org/manual/en/5.3/getting_started/about/license.html)
 
-See [Build the source preview](BUILDING.md) for the pinned upstream base, native patches and portable packaging.
+See [Build Work](BUILDING.md) for the pinned upstream base, native patches and portable packaging.
 
 [Report a bug](https://github.com/netuneed/mesh-rust-studio/issues) · [Report a security issue](SECURITY.md)

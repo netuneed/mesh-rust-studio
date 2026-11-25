@@ -90,6 +90,8 @@ internal static class PublicLauncher
         env["BLENDER_RUST_PORT_TEMP_DIR"] = temp;
         env["BLENDER_RUST_PUBLIC"] = "1";
         env["BLENDER_RUST_PUBLIC_EDITION"] = edition;
+        env["BLENDER_RUST_PORT_INSTANCE"] = edition;
+        env["BLENDER_CUSTOM_SPLASH"] = Path.Combine(Path.GetDirectoryName(executable), "MeshRustStudio-splash.png");
         if (!String.IsNullOrEmpty(roaming) && Path.IsPathRooted(roaming))
             env["BLENDER_RUST_ORIGINAL_APPDATA"] = roaming;
         if (project != null) env["BLENDER_RUST_OPENING_PROJECT"] = "1";

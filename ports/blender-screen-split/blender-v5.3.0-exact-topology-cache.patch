@@ -1,0 +1,489 @@
+diff --git a/source/blender/geometry/intern/mesh_boolean.cc b/source/blender/geometry/intern/mesh_boolean.cc
+--- a/source/blender/geometry/intern/mesh_boolean.cc
++++ b/source/blender/geometry/intern/mesh_boolean.cc
+@@ -6,7 +6,11 @@
+  * \ingroup geo
+  */
+ 
++#include <array>
++#include <cstring>
+ #include <iostream>
++#include <memory>
++#include <mutex>
+ 
+ #include "BKE_attribute.hh"
+ #include "BKE_attribute_filters.hh"
+@@ -26,6 +30,7 @@
+ #include "BLI_mesh_intersect.hh"
+ #include "BLI_span.hh"
+ #include "BLI_task.hh"
++#include "BLI_threads.hh"
+ #include "BLI_virtual_array.hh"
+ 
+ #include "GEO_mesh_boolean.hh"
+@@ -600,7 +605,8 @@
+  * For now, we only try to do this if `face` and `orig_face` have the same size.
+  * Return the number of non-null MLoops filled in.
+  */
+-static int fill_orig_loops(const meshintersect::Face *f,
++static int fill_orig_loops(const Span<int> vertex_indices,
++                           const Span<int> vertex_orig,
+                            const IndexRange orig_face,
+                            const Span<int> orig_corner_verts,
+                            int orig_me_index,
+@@ -611,7 +617,7 @@
+   const IndexRange orig_mesh_verts_range = mim.mesh_offsets.vert_offsets[orig_me_index];
+ 
+   int orig_mplen = orig_face.size();
+-  if (f->size() != orig_mplen) {
++  if (vertex_indices.size() != orig_mplen) {
+     return 0;
+   }
+   BLI_assert(r_orig_loops.size() == orig_mplen);
+@@ -621,7 +627,7 @@
+    * This may miss some cases of partial alignment, but that's OK since discovering
+    * aligned loops is only an optimization to avoid some re-interpolation.
+    */
+-  int first_orig_v = f->vert[0]->orig;
++  int first_orig_v = vertex_orig[vertex_indices[0]];
+   if (first_orig_v == meshintersect::NO_INDEX) {
+     return 0;
+   }
+@@ -645,7 +651,7 @@
+   for (int mp_loop_index = 0; mp_loop_index < orig_mplen; ++mp_loop_index) {
+     int orig_mp_loop_index = (mp_loop_index + offset) % orig_mplen;
+     const int vert_i = orig_corner_verts[orig_face.start() + orig_mp_loop_index];
+-    int fv_orig = f->vert[mp_loop_index]->orig;
++    int fv_orig = vertex_orig[vertex_indices[mp_loop_index]];
+     if (fv_orig != meshintersect::NO_INDEX) {
+       if (!orig_mesh_verts_range.contains(fv_orig)) {
+         fv_orig = meshintersect::NO_INDEX;
+@@ -654,7 +660,7 @@
+     if (vert_i == fv_orig) {
+       const int vert_next =
+           orig_corner_verts[orig_face.start() + ((orig_mp_loop_index + 1) % orig_mplen)];
+-      int fvnext_orig = f->vert[(mp_loop_index + 1) % orig_mplen]->orig;
++      int fvnext_orig = vertex_orig[vertex_indices[(mp_loop_index + 1) % orig_mplen]];
+       if (fvnext_orig != meshintersect::NO_INDEX) {
+         if (!orig_mesh_verts_range.contains(fvnext_orig)) {
+           fvnext_orig = meshintersect::NO_INDEX;
+@@ -672,8 +678,8 @@
+ /* For the loops of `face`, see if the face is unchanged from `orig_face`, and if so,
+  * copy the Loop attributes from corresponding loops to corresponding loops.
+  * Otherwise, interpolate the Loop attributes in the face `orig_face`. */
+-static void copy_or_interp_loop_attributes(const meshintersect::IMesh *im,
+-                                           Mesh *dest_mesh,
++static void copy_or_interp_loop_attributes(Mesh *dest_mesh,
++                                           const Span<int> dst_to_src_vert,
+                                            const Span<int> dst_to_src_face_map,
+                                            MeshesToIMeshInfo &mim)
+ {
+@@ -681,12 +687,14 @@
+   const Span<int> orig_corner_verts = mim.joined_mesh->corner_verts();
+   const OffsetIndices<int> dst_faces = dest_mesh->faces();
+ 
++  const Span<int> dst_corner_verts = dest_mesh->corner_verts();
+   Array<int> dst_to_src_corner_map(dst_faces.total_size());
+   for (const int face : dst_faces.index_range()) {
+-    const meshintersect::Face *f = im->face(face);
+-    const int mesh_index = mesh_id_for_face(f->orig, mim.mesh_offsets);
+-    fill_orig_loops(f,
+-                    src_faces[f->orig],
++    const int orig = dst_to_src_face_map[face];
++    const int mesh_index = mesh_id_for_face(orig, mim.mesh_offsets);
++    fill_orig_loops(dst_corner_verts.slice(dst_faces[face]),
++                    dst_to_src_vert,
++                    src_faces[orig],
+                     orig_corner_verts,
+                     mesh_index,
+                     mim,
+@@ -736,134 +744,183 @@
+ }
+ 
+ /**
+- * Convert the output IMesh im to a Blender Mesh,
+- * using the information in mim to get all the attributes right.
++ * Geometry and source indices from the exact arrangement. Source attributes are
++ * always read from the current inputs when a Blender Mesh is built.
+  */
+-static Mesh *imesh_to_mesh(meshintersect::IMesh *im, MeshesToIMeshInfo &mim)
+-{
+-  constexpr int dbg_level = 0;
+-
+-  im->populate_vert();
+-  int out_totvert = im->vert_size();
+-  int out_faces_num = im->face_size();
+-  int out_totloop = 0;
+-  for (const meshintersect::Face *f : im->faces()) {
+-    out_totloop += f->size();
+-  }
+-  /* Will calculate edges later. */
+-  Mesh *result = BKE_mesh_new_nomain(out_totvert, 0, out_faces_num, out_totloop);
++struct ExactTopology {
++  Array<float3> positions;
++  Array<int> vertex_orig;
++  Array<int> face_offsets;
++  Array<int> face_orig;
++  Array<int> corner_verts;
++  Array<int> corner_edge_orig;
++  Array<bool> corner_intersects;
++};
++
++static ExactTopology topology_from_imesh(meshintersect::IMesh &im)
++{
++  im.populate_vert();
++  ExactTopology out;
++  out.positions.reinitialize(im.vert_size());
++  out.vertex_orig.reinitialize(im.vert_size());
++  threading::parallel_for(im.vert_index_range(), 4096, [&](const IndexRange range) {
++    for (const int vert : range) {
++      const meshintersect::Vert *v = im.vert(vert);
++      copy_v3fl_v3db(out.positions[vert], v->co);
++      out.vertex_orig[vert] = v->orig;
++    }
++  });
++
++  out.face_offsets.reinitialize(im.face_size() + 1);
++  out.face_orig.reinitialize(im.face_size());
++  threading::parallel_for(im.face_index_range(), 4096, [&](const IndexRange range) {
++    for (const int face : range) {
++      out.face_offsets[face] = im.face(face)->size();
++      out.face_orig[face] = im.face(face)->orig;
++    }
++  });
++  const OffsetIndices faces = offset_indices::accumulate_counts_to_offsets(out.face_offsets);
++  out.corner_verts.reinitialize(faces.total_size());
++  out.corner_edge_orig.reinitialize(faces.total_size());
++  out.corner_intersects.reinitialize(faces.total_size());
++  threading::parallel_for(im.face_index_range(), 4096, [&](const IndexRange range) {
++    for (const int face : range) {
++      const meshintersect::Face &f = *im.face(face);
++      for (const int i : f.index_range()) {
++        const int corner = faces[face][i];
++        out.corner_verts[corner] = im.lookup_vert(f.vert[i]);
++        out.corner_edge_orig[corner] = f.edge_orig[i];
++        out.corner_intersects[corner] = f.is_intersect[i];
++      }
++    }
++  });
++  return out;
++}
++
++static Mesh *topology_to_mesh(const ExactTopology &topology,
++                              MeshesToIMeshInfo &mim,
++                              Vector<int> *r_intersecting_edges)
++{
++  Mesh *result = BKE_mesh_new_nomain(topology.positions.size(),
++                                   0,
++                                   topology.face_orig.size(),
++                                   topology.corner_verts.size());
+   BKE_mesh_copy_parameters_for_eval(result, mim.joined_mesh);
++  const bke::AttributeAccessor src_attributes = mim.joined_mesh->attributes();
+   bke::MutableAttributeAccessor dst_attributes = result->attributes_for_write();
++  result->vert_positions_for_write().copy_from(topology.positions);
++  if (!topology.face_orig.is_empty()) {
++    result->face_offsets_for_write().copy_from(topology.face_offsets);
++  }
++  result->corner_verts_for_write().copy_from(topology.corner_verts);
+ 
+   static_assert(meshintersect::NO_INDEX == -1);
+-
+-  /* Set the vertex coordinate values and other data. */
+-  MutableSpan<float3> positions = result->vert_positions_for_write();
+-  threading::parallel_for(im->vert_index_range(), 4096, [&](const IndexRange range) {
+-    for (const int vert : range) {
+-      const meshintersect::Vert *v = im->vert(vert);
+-      copy_v3fl_v3db(positions[vert], v->co);
+-    }
+-  });
+-
++  gather_attributes_with_check(src_attributes,
++                               bke::AttrDomain::Point,
++                               bke::AttrDomain::Point,
++                               bke::attribute_filter_from_skip_ref({"position"}),
++                               topology.vertex_orig,
++                               dst_attributes);
++  gather_attributes_with_check(src_attributes,
++                               bke::AttrDomain::Face,
++                               bke::AttrDomain::Face,
++                               bke::attribute_filter_from_skip_ref({"material_index"}),
++                               topology.face_orig,
++                               dst_attributes);
++  if (src_attributes.contains("material_index")) {
++    bke::SpanAttributeWriter dst_indices = dst_attributes.lookup_or_add_for_write_only_span<int>(
++        "material_index", bke::AttrDomain::Face);
++    if (mim.material_remaps.is_empty()) {
++      const VArraySpan src = *src_attributes.lookup<int>("material_index");
++      copy_attribute_using_map(src, topology.face_orig, dst_indices.span);
++    }
++    else {
++      set_material_from_map(
++          topology.face_orig, mim.material_remaps, mim.meshes, mim.mesh_offsets, dst_indices.span);
++    }
++    dst_indices.finish();
++  }
++  copy_or_interp_loop_attributes(result, topology.vertex_orig, topology.face_orig, mim);
++  bke::mesh_calc_edges(*result, false, false);
++
++  Array<int> dst_to_src_edge(result->edges_num, -1);
++  const Span<int> dst_corner_edges = result->corner_edges();
++  for (const int corner : dst_corner_edges.index_range()) {
++    if (topology.corner_edge_orig[corner] != meshintersect::NO_INDEX) {
++      dst_to_src_edge[dst_corner_edges[corner]] = topology.corner_edge_orig[corner];
++    }
++    if (r_intersecting_edges != nullptr && topology.corner_intersects[corner]) {
++      r_intersecting_edges->append(dst_corner_edges[corner]);
++    }
++  }
++  gather_attributes_with_check(src_attributes,
++                               bke::AttrDomain::Edge,
++                               bke::AttrDomain::Edge,
++                               bke::attribute_filter_from_skip_ref({".edge_verts"}),
++                               dst_to_src_edge,
++                               dst_attributes);
++  return result;
++}
++
++template<typename T> static bool same_input_bytes(const Span<T> a, const Span<T> b)
++{
++  return a.size() == b.size() &&
++         (a.is_empty() || std::memcmp(a.data(), b.data(), a.size_in_bytes()) == 0);
++}
++
++/** Match content, not data pointers that the dependency graph may replace or reuse. */
++struct ExactInputMesh {
++  Array<float3> positions;
++  Array<int2> edge_verts;
++  Array<int> face_offsets;
++  Array<int> corner_verts;
++  Array<int> corner_edges;
++
++  explicit ExactInputMesh(const Mesh &mesh)
++      : positions(mesh.vert_positions()),
++        edge_verts(mesh.edges()),
++        face_offsets(mesh.faces().data()),
++        corner_verts(mesh.corner_verts()),
++        corner_edges(mesh.corner_edges())
+   {
+-    Array<int> dst_to_src_vert(out_totvert);
+-    threading::parallel_for(positions.index_range(), 4096, [&](const IndexRange range) {
+-      for (const int vert : range) {
+-        const meshintersect::Vert *v = im->vert(vert);
+-        dst_to_src_vert[vert] = v->orig;
+-      }
+-    });
+-    gather_attributes_with_check(mim.joined_mesh->attributes(),
+-                                 bke::AttrDomain::Point,
+-                                 bke::AttrDomain::Point,
+-                                 bke::attribute_filter_from_skip_ref({"position"}),
+-                                 dst_to_src_vert,
+-                                 dst_attributes);
+-  }
+-
++  }
++
++  bool matches(const Mesh &mesh) const
+   {
+-    OffsetIndices<int> dst_faces;
+-    if (out_faces_num != 0) {
+-      MutableSpan<int> face_offsets = result->face_offsets_for_write();
+-      threading::parallel_for(im->face_index_range(), 4096, [&](const IndexRange range) {
+-        for (const int face : range) {
+-          const meshintersect::Face *f = im->face(face);
+-          face_offsets[face] = f->size();
+-        }
+-      });
+-      dst_faces = offset_indices::accumulate_counts_to_offsets(face_offsets);
+-    }
+-
+-    MutableSpan<int> dst_corner_verts = result->corner_verts_for_write();
+-    threading::parallel_for(im->face_index_range(), 4096, [&](const IndexRange range) {
+-      for (const int face : range) {
+-        const meshintersect::Face *f = im->face(face);
+-        MutableSpan<int> face_verts = dst_corner_verts.slice(dst_faces[face]);
+-        for (const int i : face_verts.index_range()) {
+-          face_verts[i] = im->lookup_vert(f->vert[i]);
+-        }
+-      }
+-    });
+-
+-    Array<int> dst_to_src_face(out_faces_num);
+-    threading::parallel_for(im->face_index_range(), 4096, [&](const IndexRange range) {
+-      for (const int face : range) {
+-        const meshintersect::Face *f = im->face(face);
+-        dst_to_src_face[face] = f->orig;
+-      }
+-    });
+-    gather_attributes_with_check(mim.joined_mesh->attributes(),
+-                                 bke::AttrDomain::Face,
+-                                 bke::AttrDomain::Face,
+-                                 bke::attribute_filter_from_skip_ref({"material_index"}),
+-                                 dst_to_src_face,
+-                                 dst_attributes);
+-
+-    if (mim.joined_mesh->attributes().contains("material_index")) {
+-      bke::SpanAttributeWriter dst_indices = dst_attributes.lookup_or_add_for_write_only_span<int>(
+-          "material_index", bke::AttrDomain::Face);
+-      if (mim.material_remaps.is_empty()) {
+-        const VArraySpan src = *mim.joined_mesh->attributes().lookup<int>("material_index");
+-        copy_attribute_using_map(src, dst_to_src_face, dst_indices.span);
+-      }
+-      else {
+-        set_material_from_map(
+-            dst_to_src_face, mim.material_remaps, mim.meshes, mim.mesh_offsets, dst_indices.span);
+-      }
+-      dst_indices.finish();
+-    }
+-
+-    copy_or_interp_loop_attributes(im, result, dst_to_src_face, mim);
+-  }
+-
+-  bke::mesh_calc_edges(*result, false, false);
+-
++    return same_input_bytes<float3>(positions, mesh.vert_positions()) &&
++           same_input_bytes<int2>(edge_verts, mesh.edges()) &&
++           same_input_bytes<int>(face_offsets, mesh.faces().data()) &&
++           same_input_bytes<int>(corner_verts, mesh.corner_verts()) &&
++           same_input_bytes<int>(corner_edges, mesh.corner_edges());
++  }
++};
++
++struct ExactTopologyCache {
++  ExactInputMesh first;
++  ExactInputMesh second;
++  Array<float4x4> transforms;
++  int threads;
++  ExactTopology topology;
++
++  bool matches(const Span<const Mesh *> meshes, const Span<float4x4> matrices) const
+   {
+-    Array<int> dst_to_src_edge(result->edges_num, -1);
+-    const OffsetIndices dst_polys = result->faces();
+-    const Span<int> dst_corner_edges = result->corner_edges();
+-    for (int fi : im->face_index_range()) {
+-      const meshintersect::Face *f = im->face(fi);
+-      const IndexRange face = dst_polys[fi];
+-      for (int j : f->index_range()) {
+-        if (f->edge_orig[j] != meshintersect::NO_INDEX) {
+-          dst_to_src_edge[dst_corner_edges[face[j]]] = f->edge_orig[j];
+-        }
+-      }
+-    }
+-    gather_attributes_with_check(mim.joined_mesh->attributes(),
+-                                 bke::AttrDomain::Edge,
+-                                 bke::AttrDomain::Edge,
+-                                 bke::attribute_filter_from_skip_ref({".edge_verts"}),
+-                                 dst_to_src_edge,
+-                                 dst_attributes);
+-  }
+-
+-  if (dbg_level > 0) {
+-    bke::mesh_validate(*result, true);
+-  }
+-  return result;
++    return threads == BLI_system_thread_count() &&
++           same_input_bytes<float4x4>(transforms, matrices) && first.matches(*meshes[0]) &&
++           second.matches(*meshes[1]);
++  }
++};
++
++struct ExactTopologyCacheState {
++  std::mutex mutex;
++  std::array<std::shared_ptr<const ExactTopologyCache>, 2> entries;
++  size_t next_slot = 0;
++};
++
++static ExactTopologyCacheState &exact_topology_cache_state()
++{
++  /* Construct after guardedalloc's leak detector, so its arrays are released first. */
++  static ExactTopologyCacheState state;
++  return state;
+ }
+ 
+ static meshintersect::BoolOpType operation_to_mesh_arr_mode(const Operation operation)
+@@ -906,35 +963,60 @@
+   }
+   MeshesToIMeshInfo mim(meshes);
+   mim.joined_mesh = joined_mesh;
+-  meshintersect::IMeshArena arena;
+-  meshintersect::IMesh m_in = meshes_to_imesh(meshes, transforms, material_remaps, arena, &mim);
+-  const auto shape_fn = [&](int f) { return mesh_id_for_face(f, mim.mesh_offsets); };
+-  meshintersect::IMesh m_out = boolean_mesh(
+-      m_in, boolean_mode, meshes.size(), shape_fn, use_self, hole_tolerant, nullptr, &arena);
+-  if (dbg_level > 0) {
+-    std::cout << m_out;
+-    write_obj_mesh(m_out, "m_out");
+-  }
+-
+-  Mesh *result = imesh_to_mesh(&m_out, mim);
+-
+-  /* Store intersecting edge indices. */
+-  if (r_intersecting_edges != nullptr) {
+-    const OffsetIndices faces = result->faces();
+-    const Span<int> corner_edges = result->corner_edges();
+-    for (int fi : m_out.face_index_range()) {
+-      const meshintersect::Face &face = *m_out.face(fi);
+-      const IndexRange mesh_face = faces[fi];
+-      for (int i : face.index_range()) {
+-        if (face.is_intersect[i]) {
+-          int e_index = corner_edges[mesh_face[i]];
+-          r_intersecting_edges->append(e_index);
+-        }
++  mim.meshes = meshes;
++  mim.material_remaps = material_remaps;
++
++  const int64_t input_corners = mim.mesh_offsets.corner_offsets.total_size();
++  const bool cacheable = meshes.size() == 2 && !use_self && !hole_tolerant &&
++                         boolean_mode == meshintersect::BoolOpType::Difference &&
++                         input_corners >= 131072 && input_corners <= 750000 &&
++                         mim.mesh_offsets.vert_offsets.total_size() <= 250000 &&
++                         mim.mesh_offsets.edge_offsets.total_size() <= 350000;
++  if (cacheable) {
++    ExactTopologyCacheState &cache = exact_topology_cache_state();
++    decltype(cache.entries) candidates;
++    {
++      std::lock_guard lock(cache.mutex);
++      candidates = cache.entries;
++    }
++    for (const auto &cached : candidates) {
++      if (cached && cached->matches(meshes, transforms)) {
++        return topology_to_mesh(cached->topology, mim, r_intersecting_edges);
+       }
+     }
+   }
+ 
+-  return result;
++  ExactTopology topology;
++  {
++    meshintersect::IMeshArena arena;
++    meshintersect::IMesh m_in = meshes_to_imesh(meshes, transforms, material_remaps, arena, &mim);
++    const auto shape_fn = [&](int f) { return mesh_id_for_face(f, mim.mesh_offsets); };
++    meshintersect::IMesh m_out = boolean_mesh(
++        m_in, boolean_mode, meshes.size(), shape_fn, use_self, hole_tolerant, nullptr, &arena);
++    if (dbg_level > 0) {
++      std::cout << m_out;
++      write_obj_mesh(m_out, "m_out");
++    }
++    topology = topology_from_imesh(m_out);
++  }
++
++  if (cacheable && topology.corner_verts.size() <= 1000000) {
++    auto current = std::make_shared<ExactTopologyCache>(
++        ExactInputMesh(*meshes[0]),
++        ExactInputMesh(*meshes[1]),
++        Array<float4x4>(transforms),
++        BLI_system_thread_count(),
++        std::move(topology));
++    ExactTopologyCacheState &cache = exact_topology_cache_state();
++    std::shared_ptr<const ExactTopologyCache> evicted;
++    {
++      std::lock_guard lock(cache.mutex);
++      evicted = std::exchange(cache.entries[cache.next_slot], current);
++      cache.next_slot = (cache.next_slot + 1) % cache.entries.size();
++    }
++    return topology_to_mesh(current->topology, mim, r_intersecting_edges);
++  }
++  return topology_to_mesh(topology, mim, r_intersecting_edges);
+ }
+ 
+ #endif  // WITH_GMP

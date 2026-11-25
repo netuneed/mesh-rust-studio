@@ -1,0 +1,104 @@
+diff --git a/intern/ghost/intern/GHOST_SystemWin32.cc b/intern/ghost/intern/GHOST_SystemWin32.cc
+--- a/intern/ghost/intern/GHOST_SystemWin32.cc
++++ b/intern/ghost/intern/GHOST_SystemWin32.cc
+@@ -176,11 +176,11 @@
+   wchar_t port_instance[8] = {};
+   const DWORD length = GetEnvironmentVariableW(
+       L"BLENDER_RUST_PORT_INSTANCE", port_instance, ARRAYSIZE(port_instance));
+-  if (length == 4 && lstrcmpW(port_instance, L"work") == 0) {
+-    app_id = L"BlenderFoundation.BlenderRust.Work.5.3";
++  if (length == 0 || (length == 4 && lstrcmpW(port_instance, L"work") == 0)) {
++    app_id = L"MeshRustStudio.Work.5.3";
+   }
+   else if (length == 3 && lstrcmpW(port_instance, L"dev") == 0) {
+-    app_id = L"BlenderFoundation.BlenderRust.Dev.5.3";
++    app_id = L"MeshRustStudio.Dev.5.3";
+   }
+   SetCurrentProcessExplicitAppUserModelID(app_id);
+   UTF16_UN_ENCODE(BLENDER_WIN_APPID);
+diff --git a/intern/ghost/intern/GHOST_WindowWin32.cc b/intern/ghost/intern/GHOST_WindowWin32.cc
+--- a/intern/ghost/intern/GHOST_WindowWin32.cc
++++ b/intern/ghost/intern/GHOST_WindowWin32.cc
+@@ -1230,8 +1230,8 @@
+   wchar_t port_instance[8] = {};
+   const DWORD instance_length = GetEnvironmentVariableW(
+       L"BLENDER_RUST_PORT_INSTANCE", port_instance, ARRAYSIZE(port_instance));
+-  if (instance_length == 4 &&
+-      lstrcmpW(port_instance, L"work") == 0)
++  if (instance_length == 0 ||
++      (instance_length == 4 && lstrcmpW(port_instance, L"work") == 0))
+   {
+     wchar_t executable[MAX_PATH] = {};
+     const DWORD length = GetModuleFileNameW(nullptr, executable, ARRAYSIZE(executable));
+@@ -1239,7 +1239,7 @@
+     std::wstring launcher;
+     if (length != 0 && length < ARRAYSIZE(executable) && name) {
+       launcher.assign(executable, size_t(name + 1 - executable));
+-      launcher += L"Blender+ RUST.exe";
++      launcher += L"Mesh Rust Studio.exe";
+     }
+ 
+     IPropertyStore *properties;
+@@ -1255,10 +1255,10 @@
+         const std::wstring command = L"\"" + launcher + L"\"";
+         const std::wstring icon = launcher + L",0";
+         set_string(PKEY_AppUserModel_RelaunchCommand, command.c_str());
+-        set_string(PKEY_AppUserModel_RelaunchDisplayNameResource, L"Blender+ RUST");
++        set_string(PKEY_AppUserModel_RelaunchDisplayNameResource, L"Mesh Rust Studio");
+         set_string(PKEY_AppUserModel_RelaunchIconResource, icon.c_str());
+       }
+-      set_string(PKEY_AppUserModel_ID, L"BlenderFoundation.BlenderRust.Work.5.3");
++      set_string(PKEY_AppUserModel_ID, L"MeshRustStudio.Work.5.3");
+       properties->Release();
+     }
+ 
+diff --git a/source/blender/windowmanager/intern/wm_window.cc b/source/blender/windowmanager/intern/wm_window.cc
+--- a/source/blender/windowmanager/intern/wm_window.cc
++++ b/source/blender/windowmanager/intern/wm_window.cc
+@@ -691,14 +691,14 @@
+   /* If a project is active, display its name. */
+   wm_window_title_project_append(win_title);
+ 
+-  win_title.append(StringRef(" — Blender "));
++  win_title.append(StringRef(" - Mesh Rust Studio "));
+   win_title.append(StringRef(BKE_blender_version_string()));
+   if (const char *instance = BLI_getenv("BLENDER_RUST_PORT_INSTANCE")) {
+     if (STREQ(instance, "work")) {
+-      win_title.append(StringRef(" [Rust]"));
++      win_title.append(StringRef(" [Work]"));
+     }
+     else if (STREQ(instance, "dev")) {
+-      win_title.append(StringRef(" [Rust Dev]"));
++      win_title.append(StringRef(" [Dev]"));
+     }
+   }
+ }
+diff --git a/release/windows/icons/winblender.rc b/release/windows/icons/winblender.rc
+--- a/release/windows/icons/winblender.rc
++++ b/release/windows/icons/winblender.rc
+@@ -9,8 +9,8 @@
+ 	#define BLEN_VER_RC_STR STRINGIFY(BLEN_VER_RC_STR_M)
+ #endif
+ 
+-APPICON ICON DISCARDABLE "winblender.ico"
+-BLENDERFILE ICON DISCARDABLE "winblenderfile.ico"
++APPICON ICON DISCARDABLE "meshruststudio.ico"
++BLENDERFILE ICON DISCARDABLE "meshruststudio.ico"
+ 
+ IDR_VERSION1 VERSIONINFO
+ FILEVERSION BLEN_VER_RC_1, BLEN_VER_RC_2, BLEN_VER_RC_3, BLEN_VER_RC_4
+@@ -24,11 +24,11 @@
+     BEGIN
+       VALUE "FileVersion", BLEN_VER_RC_STR
+       VALUE "ProductVersion", BLEN_VER_RC_STR
+-      VALUE "CompanyName", "Blender Foundation"
+-      VALUE "FileDescription", "Blender"
++      VALUE "CompanyName", "Mesh Rust Studio"
++      VALUE "FileDescription", "Mesh Rust Studio Work"
+       VALUE "LegalCopyright", "GPLv3 (Blender Foundation)"
+       VALUE "OriginalFilename", "blender.exe"
+-      VALUE "ProductName", "Blender"
++      VALUE "ProductName", "Mesh Rust Studio"
+     END
+   END
+   BLOCK "VarFileInfo"

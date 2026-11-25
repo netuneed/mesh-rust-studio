@@ -6,7 +6,7 @@ Mesh Rust Studio - независимая сборка Blender 5.3 для Window
 
 ## Что уже улучшили
 
-В Work есть Auto UV, QuadriFlow и упрощение сетки. Мастер первого запуска переносит выбранные настройки и подключает существующие папки ассетов и расширений. У Work и Dev отдельные профили.
+В Work есть Boolean Plus, Auto UV, QuadriFlow и упрощение сетки. Мастер первого запуска переносит выбранные настройки и подключает существующие папки ассетов и расширений. У Work и Dev отдельные профили.
 
 | Замер | Было → стало | За счёт чего |
 | --- | ---: | --- |
@@ -17,28 +17,26 @@ Mesh Rust Studio - независимая сборка Blender 5.3 для Window
 
 Медианы локальных тестов на Windows. Запуск и Smart UV сравнивались с прежними сборками проекта. Edit Mode и Undo сравнивались со штатным Blender 5.3.0 в одинаковых условиях.
 
-**Дальше**. Сократить паузы при правке Subdivision и общего Boolean-резака. После обновления встроенных зависимостей пересобрать и проверить Work и Dev.
+## Скачать для Windows
 
-**Безопасность**. В открытом выпуске доступны исходники. Windows-сборки ждут исправления встроенного FFmpeg 8.1 (CVE-2026-8461) и обновления Python и сетевых библиотек. [Как сообщить об уязвимости](SECURITY.md) · [Список исправлений FFmpeg](https://ffmpeg.org/security.html)
+Work 0.12 работает под Windows x64. Распакуйте весь ZIP и запустите **Mesh Rust Studio.exe**. Сборка хранит свой профиль в `%LOCALAPPDATA%\MeshRustStudio\work`. [Скачать Work для Windows x64](https://github.com/netuneed/mesh-rust-studio/releases/download/v0.12.0-work/MeshRustStudio-Work-0.12-Windows-x64.zip) · [Контрольные суммы и исходники](https://github.com/netuneed/mesh-rust-studio/releases/tag/v0.12.0-work)
 
-## Скачать
-
-**Статус выпуска**. Сборки для Windows ждут обновления встроенных зависимостей.
-
-Откройте [GitHub Releases](https://github.com/netuneed/mesh-rust-studio/releases). Версия готова к установке, когда её ZIP и контрольные суммы появились в разделе **Assets** опубликованного релиза.
-
-| Версия | ZIP | Для чего |
-| --- | --- | --- |
-| Work | `MeshRustStudio-Work-Windows-x64.zip` | Повседневная работа, Auto UV, QuadriFlow и упрощение сетки |
-| Dev | `MeshRustStudio-Dev-Windows-x64.zip` | Проверка изменений разработки в отдельном профиле |
-
-Нужны 64-битная Windows, процессор x64 и поддерживаемый Blender драйвер видеокарты. Проверенные версии и возможности GPU указаны в примечаниях к релизу. [Требования Blender](https://www.blender.org/download/requirements/)
-
-Чтобы проверить архив, выполните команду PowerShell в папке загрузки и сравните результат с SHA-256 на странице релиза. Для Dev подставьте имя его ZIP.
+Чтобы проверить загрузку, сравните результат команды PowerShell со строкой архива в `SHA256SUMS.txt`.
 
 ```powershell
-Get-FileHash -Algorithm SHA256 .\MeshRustStudio-Work-Windows-x64.zip
+Get-FileHash -Algorithm SHA256 .\MeshRustStudio-Work-0.12-Windows-x64.zip
 ```
+
+## Boolean Plus
+
+1. Выберите меш, к которому хотите добавить вырез. Откройте **Properties > Modifiers > Add Modifier > Blender Plus > Boolean Plus**.
+2. Укажите второй меш пипеткой **Cutter**. Выберите вычитание **Difference**, объединение **Union** или пересечение **Intersection**.
+3. Для точного расчёта выберите **Solver > Exact**. В режиме **Auto** модификатор может использовать Manifold для подходящих сеток. Вид резака задаёт **Cutter Display**.
+4. Настройки предпросмотра и применение находятся в разделе **Tools**. В старом файле выберите **Enable Editable Controls**, чтобы обновить выбранный модификатор.
+
+![Модификатор Boolean Plus с вычитанием и каркасным резаком](docs/boolean-plus.png)
+
+В Work 0.12 исправлен вылет при обработке таймера файлового браузера. Сбой мог проявиться при переключении вида, если в рабочем пространстве свёрнут браузер ассетов.
 
 ## Первый запуск
 
@@ -62,7 +60,7 @@ Work и Dev используют отдельные профили в `%LOCALAPP
 
 ## Исходники и поддержка
 
-Проект основан на [Blender 5.3.0](https://github.com/blender/blender/tree/02f0899d78e374b63e7181d9061e1f7ab03419cc). На странице каждого релиза рядом со сборками для Windows будут соответствующие исходники и инструкции сборки. Blender и включённые компоненты сохраняют свои лицензии. [Лицензия Blender](https://docs.blender.org/manual/en/5.3/getting_started/about/license.html)
+Проект основан на [Blender 5.3.0](https://github.com/blender/blender/tree/02f0899d78e374b63e7181d9061e1f7ab03419cc). На странице выпуска доступны соответствующие исходники и инструкции сборки. Blender и включённые компоненты сохраняют свои лицензии. [Лицензия Blender](https://docs.blender.org/manual/en/5.3/getting_started/about/license.html)
 
 Рабочий процесс и инструкции сборки сохранены в разделе [Сборка исходников](BUILDING.md).
 

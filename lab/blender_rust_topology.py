@@ -8,9 +8,9 @@ from idprop.types import IDPropertyGroup
 
 
 bl_info = {
-    "name": "Blender+ RUST Topology",
+    "name": "Mesh Rust Studio Topology",
     "category": "Mesh",
-    "location": "3D View > Sidebar > Blender+ RUST",
+    "location": "3D View > Sidebar > Mesh Rust Studio",
     "description": "Quad remesh and simplify the evaluated surface to a separate object",
     "version": (1, 0, 0),
     "blender": (5, 3, 0),
@@ -200,7 +200,7 @@ class BLENDER_RUST_PT_topology(bpy.types.Panel):
     bl_idname = "BLENDER_RUST_PT_topology"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
-    bl_category = "Blender+ RUST"
+    bl_category = "Mesh Rust Studio"
 
     @classmethod
     def poll(cls, context):

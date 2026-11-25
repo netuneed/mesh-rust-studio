@@ -1,0 +1,913 @@
+diff --git a/source/blender/blenlib/intern/mesh_intersect.cc b/source/blender/blenlib/intern/mesh_intersect.cc
+--- a/source/blender/blenlib/intern/mesh_intersect.cc
++++ b/source/blender/blenlib/intern/mesh_intersect.cc
+@@ -10,11 +10,15 @@
+ #ifdef WITH_GMP
+ 
+ #  include <algorithm>
++#  include <array>
++#  include <bit>
+ #  include <fstream>
+ #  include <functional>
+ #  include <iostream>
++#  include <limits>
+ #  include <memory>
+ #  include <numeric>
++#  include <optional>
+ 
+ #  include "BLI_array.hh"
+ #  include "BLI_assert.hh"
+@@ -70,15 +74,20 @@
+   return this->co_exact == other.co_exact;
+ }
+ 
+-uint64_t Vert::hash() const
+-{
+-  uint64_t x = *reinterpret_cast<const uint64_t *>(&co.x);
+-  uint64_t y = *reinterpret_cast<const uint64_t *>(&co.y);
+-  uint64_t z = *reinterpret_cast<const uint64_t *>(&co.z);
++static uint64_t hash_vert_coordinates(const double3 &co)
++{
++  uint64_t x = std::bit_cast<uint64_t>(co.x);
++  uint64_t y = std::bit_cast<uint64_t>(co.y);
++  uint64_t z = std::bit_cast<uint64_t>(co.z);
+   x = (x >> 56) ^ (x >> 46) ^ x;
+   y = (y >> 55) ^ (y >> 45) ^ y;
+   z = (z >> 54) ^ (z >> 44) ^ z;
+   return x ^ y ^ z;
++}
++
++uint64_t Vert::hash() const
++{
++  return hash_vert_coordinates(this->co);
+ }
+ 
+ std::ostream &operator<<(std::ostream &os, const Vert *v)
+@@ -293,6 +302,10 @@
+  * exist. I.e., it de-duplicates the vertices.
+  */
+ class IMeshArena::IMeshArenaImpl : NonCopyable, NonMovable {
++  struct VSetProbe {
++    const mpq3 &exact;
++    const double3 &approximate;
++  };
+ 
+   /**
+    * Don't use Vert itself as key since resizing may move
+@@ -312,6 +325,16 @@
+     bool operator==(const VSetKey &other) const
+     {
+       return *this->vert == *other.vert;
++    }
++
++    static uint64_t hash_as(const VSetProbe &probe)
++    {
++      return hash_vert_coordinates(probe.approximate);
++    }
++
++    bool operator==(const VSetProbe &probe) const
++    {
++      return this->vert->co_exact == probe.exact;
+     }
+   };
+ 
+@@ -421,30 +444,18 @@
+  private:
+   const Vert *add_or_find_vert(const mpq3 &mco, const double3 &dco, int orig)
+   {
+-    Vert *vtry = new Vert(mco, dco, NO_INDEX, NO_INDEX);
+-    const Vert *ans;
+-    VSetKey vskey(vtry);
+     std::lock_guard lock(mutex_);
+-    const VSetKey *lookup = vset_.lookup_key_ptr(vskey);
+-    if (!lookup) {
+-      vtry->id = next_vert_id_++;
+-      vtry->orig = orig;
+-      vskey.vert = vtry;  // new Vert(mco, dco, next_vert_id_++, orig);
+-      vset_.add_new(vskey);
+-      allocated_verts_.append(std::unique_ptr<Vert>(vskey.vert));
+-      ans = vskey.vert;
+-    }
+-    else {
+-      /* It was a duplicate, so return the existing one.
+-       * Note that the returned Vert may have a different orig.
+-       * This is the intended semantics: if the Vert already
+-       * exists then we are merging verts and using the first-seen
+-       * one as the canonical one. */
+-      delete vtry;
+-      ans = lookup->vert;
+-    }
+-    return ans;
+-  };
++    if (const VSetKey *existing = vset_.lookup_key_ptr_as(VSetProbe{mco, dco})) {
++      /* Use the first-seen vertex and its original index. */
++      return existing->vert;
++    }
++    /* Exact coordinates allocate GMP storage. Copy them only on insertion. */
++    auto vertex = std::make_unique<Vert>(mco, dco, next_vert_id_++, orig);
++    Vert *result = vertex.get();
++    vset_.add_new(VSetKey(result));
++    allocated_verts_.append(std::move(vertex));
++    return result;
++  }
+ 
+   const Vert *add_or_find_vert_(Vert *vtry)
+   {
+@@ -904,8 +915,9 @@
+ enum ITT_value_kind { INONE, IPOINT, ISEGMENT, ICOPLANAR };
+ 
+ struct ITT_value {
+-  mpq3 p1;           /* Only relevant for IPOINT and ISEGMENT kind. */
+-  mpq3 p2;           /* Only relevant for ISEGMENT kind. */
++  /* Most candidate pairs miss. Construct exact coordinates only for actual intersections. */
++  std::optional<mpq3> p1; /* IPOINT and ISEGMENT. */
++  std::optional<mpq3> p2; /* ISEGMENT. */
+   int t_source = -1; /* Index of the source triangle that intersected the target one. */
+   enum ITT_value_kind kind = INONE;
+ 
+@@ -1069,7 +1081,6 @@
+ /**
+  * Return +1, 0, -1 as a + ad is above, on, or below the oriented plane containing a, b, c in CCW
+  * order. This is the same as -oriented(a, b, c, a + ad), but uses fewer arithmetic operations.
+- * TODO: change arguments to `const Vert *` and use floating filters.
+  * The ba, ca, n, and dotbuf arguments are used as temporaries; declaring them
+  * in the caller can avoid many allocations and frees of mpq3 and mpq_class structures.
+  */
+@@ -1092,6 +1103,43 @@
+   n.z = ba.x * ca.y - ba.y * ca.x;
+ 
+   return sgn(math::dot_with_buffer(ad, n, dotbuf));
++}
++
++/**
++ * Filter the side of d against the oriented plane abc. A zero result means that
++ * the floating determinant could not certify the sign.
++ */
++static inline int tti_filtered_above(const double3 &a,
++                                     const double3 &b,
++                                     const double3 &c,
++                                     const double3 &d)
++{
++  const double determinant = math::dot(d - a, math::cross(b - a, c - a));
++  if (determinant == 0.0) {
++    return 0;
++  }
++
++  const double3 abs_a = math::abs(a);
++  const double3 ba_bound = math::abs(b) + abs_a;
++  const double3 ca_bound = math::abs(c) + abs_a;
++  const double3 da_bound = math::abs(d) + abs_a;
++  if (!(math::reduce_max(math::max(ba_bound, math::max(ca_bound, da_bound))) <= 0x1p100)) {
++    return 0;
++  }
++
++  const double3 cross_bound(ba_bound.y * ca_bound.z + ba_bound.z * ca_bound.y,
++                            ba_bound.z * ca_bound.x + ba_bound.x * ca_bound.z,
++                            ba_bound.x * ca_bound.y + ba_bound.y * ca_bound.x);
++  const double supremum = math::dot(da_bound, cross_bound);
++  /* Bound the six degree-three monomials before cancellation. The multiplier
++   * covers truncating each exact coordinate to double, the difference/product/
++   * sum operations, and rounding of this bound. The absolute floor covers
++   * subnormal arithmetic with the coordinate range bounded above. */
++  const double error = 64.0 * DBL_EPSILON * supremum + 0x1p-500;
++  if (std::abs(determinant) > error) {
++    return determinant > 0.0 ? 1 : -1;
++  }
++  return 0;
+ }
+ 
+ /**
+@@ -1107,49 +1155,63 @@
+  *   of the plane and at least one of q1 and r1 are off the plane.
+  * Similarly for p2, q2, r2 with respect to the first triangle's plane.
+  */
+-static ITT_value itt_canon2(const mpq3 &p1,
+-                            const mpq3 &q1,
+-                            const mpq3 &r1,
+-                            const mpq3 &p2,
+-                            const mpq3 &q2,
+-                            const mpq3 &r2,
++static ITT_value itt_canon2(const Vert &p1,
++                            const Vert &q1,
++                            const Vert &r1,
++                            const Vert &p2,
++                            const Vert &q2,
++                            const Vert &r2,
+                             const mpq3 &n1,
+                             const mpq3 &n2)
+ {
+   constexpr int dbg_level = 0;
+   if (dbg_level > 0) {
+     std::cout << "\ntri_tri_intersect_canon:\n";
+-    std::cout << "p1=" << p1 << " q1=" << q1 << " r1=" << r1 << "\n";
+-    std::cout << "p2=" << p2 << " q2=" << q2 << " r2=" << r2 << "\n";
++    std::cout << "p1=" << p1.co_exact << " q1=" << q1.co_exact << " r1=" << r1.co_exact << "\n";
++    std::cout << "p2=" << p2.co_exact << " q2=" << q2.co_exact << " r2=" << r2.co_exact << "\n";
+     std::cout << "n1=" << n1 << " n2=" << n2 << "\n";
+     std::cout << "approximate values:\n";
+-    std::cout << "p1=(" << p1[0].get_d() << "," << p1[1].get_d() << "," << p1[2].get_d() << ")\n";
+-    std::cout << "q1=(" << q1[0].get_d() << "," << q1[1].get_d() << "," << q1[2].get_d() << ")\n";
+-    std::cout << "r1=(" << r1[0].get_d() << "," << r1[1].get_d() << "," << r1[2].get_d() << ")\n";
+-    std::cout << "p2=(" << p2[0].get_d() << "," << p2[1].get_d() << "," << p2[2].get_d() << ")\n";
+-    std::cout << "q2=(" << q2[0].get_d() << "," << q2[1].get_d() << "," << q2[2].get_d() << ")\n";
+-    std::cout << "r2=(" << r2[0].get_d() << "," << r2[1].get_d() << "," << r2[2].get_d() << ")\n";
++    std::cout << "p1=(" << p1.co[0] << "," << p1.co[1] << "," << p1.co[2] << ")\n";
++    std::cout << "q1=(" << q1.co[0] << "," << q1.co[1] << "," << q1.co[2] << ")\n";
++    std::cout << "r1=(" << r1.co[0] << "," << r1.co[1] << "," << r1.co[2] << ")\n";
++    std::cout << "p2=(" << p2.co[0] << "," << p2.co[1] << "," << p2.co[2] << ")\n";
++    std::cout << "q2=(" << q2.co[0] << "," << q2.co[1] << "," << q2.co[2] << ")\n";
++    std::cout << "r2=(" << r2.co[0] << "," << r2.co[1] << "," << r2.co[2] << ")\n";
+     std::cout << "n1=(" << n1[0].get_d() << "," << n1[1].get_d() << "," << n1[2].get_d() << ")\n";
+     std::cout << "n2=(" << n2[0].get_d() << "," << n2[1].get_d() << "," << n2[2].get_d() << ")\n";
+   }
+-  mpq3 p1p2 = p2 - p1;
+-  mpq3 intersect_1;
+-  mpq3 intersect_2;
+-  mpq3 buf[4];
+-  bool no_overlap = false;
++  std::optional<mpq3> p1p2;
++  std::optional<std::array<mpq3, 4>> scratch;
++  const auto above = [&](const Vert &b, const Vert &c) {
++    const int sign = tti_filtered_above(p1.co, b.co, c.co, p2.co);
++    if (sign != 0) {
++      return sign;
++    }
++    if (!p1p2) {
++      p1p2.emplace(p2.co_exact - p1.co_exact);
++    }
++    auto &buf = scratch ? *scratch : scratch.emplace();
++    return tti_above(p1.co_exact, b.co_exact, c.co_exact, *p1p2, buf[0], buf[1], buf[2], buf[3]);
++  };
++  const auto interp = [&](const Vert &a, const Vert &b, const Vert &c, const mpq3 &n) {
++    auto &buf = scratch ? *scratch : scratch.emplace();
++    return tti_interp(a.co_exact, b.co_exact, c.co_exact, n, buf[0], buf[1], buf[2]);
++  };
++  std::optional<mpq3> intersect_1;
++  std::optional<mpq3> intersect_2;
+   /* Top test in classification tree. */
+-  if (tti_above(p1, q1, r2, p1p2, buf[0], buf[1], buf[2], buf[3]) > 0) {
++  if (above(q1, r2) > 0) {
+     /* Middle right test in classification tree. */
+-    if (tti_above(p1, r1, r2, p1p2, buf[0], buf[1], buf[2], buf[3]) <= 0) {
++    if (above(r1, r2) <= 0) {
+       /* Bottom right test in classification tree. */
+-      if (tti_above(p1, r1, q2, p1p2, buf[0], buf[1], buf[2], buf[3]) > 0) {
++      if (above(r1, q2) > 0) {
+         /* Overlap is [k [i l] j]. */
+         if (dbg_level > 0) {
+           std::cout << "overlap [k [i l] j]\n";
+         }
+         /* i is intersect with p1r1. l is intersect with p2r2. */
+-        intersect_1 = tti_interp(p1, r1, p2, n2, buf[0], buf[1], buf[2]);
+-        intersect_2 = tti_interp(p2, r2, p1, n1, buf[0], buf[1], buf[2]);
++        intersect_1.emplace(interp(p1, r1, p2, n2));
++        intersect_2.emplace(interp(p2, r2, p1, n1));
+       }
+       else {
+         /* Overlap is [i [k l] j]. */
+@@ -1157,8 +1219,8 @@
+           std::cout << "overlap [i [k l] j]\n";
+         }
+         /* k is intersect with p2q2. l is intersect is p2r2. */
+-        intersect_1 = tti_interp(p2, q2, p1, n1, buf[0], buf[1], buf[2]);
+-        intersect_2 = tti_interp(p2, r2, p1, n1, buf[0], buf[1], buf[2]);
++        intersect_1.emplace(interp(p2, q2, p1, n1));
++        intersect_2.emplace(interp(p2, r2, p1, n1));
+       }
+     }
+     else {
+@@ -1166,28 +1228,28 @@
+       if (dbg_level > 0) {
+         std::cout << "no overlap: [k l] [i j]\n";
+       }
+-      no_overlap = true;
++      return ITT_value(INONE);
+     }
+   }
+   else {
+     /* Middle left test in classification tree. */
+-    if (tti_above(p1, q1, q2, p1p2, buf[0], buf[1], buf[2], buf[3]) < 0) {
++    if (above(q1, q2) < 0) {
+       /* No overlap: [i j] [k l]. */
+       if (dbg_level > 0) {
+         std::cout << "no overlap: [i j] [k l]\n";
+       }
+-      no_overlap = true;
++      return ITT_value(INONE);
+     }
+     else {
+       /* Bottom left test in classification tree. */
+-      if (tti_above(p1, r1, q2, p1p2, buf[0], buf[1], buf[2], buf[3]) >= 0) {
++      if (above(r1, q2) >= 0) {
+         /* Overlap is [k [i j] l]. */
+         if (dbg_level > 0) {
+           std::cout << "overlap [k [i j] l]\n";
+         }
+         /* i is intersect with p1r1. j is intersect with p1q1. */
+-        intersect_1 = tti_interp(p1, r1, p2, n2, buf[0], buf[1], buf[2]);
+-        intersect_2 = tti_interp(p1, q1, p2, n2, buf[0], buf[1], buf[2]);
++        intersect_1.emplace(interp(p1, r1, p2, n2));
++        intersect_2.emplace(interp(p1, q1, p2, n2));
+       }
+       else {
+         /* Overlap is [i [k j] l]. */
+@@ -1195,34 +1257,32 @@
+           std::cout << "overlap [i [k j] l]\n";
+         }
+         /* k is intersect with p2q2. j is intersect with p1q1. */
+-        intersect_1 = tti_interp(p2, q2, p1, n1, buf[0], buf[1], buf[2]);
+-        intersect_2 = tti_interp(p1, q1, p2, n2, buf[0], buf[1], buf[2]);
+-      }
+-    }
+-  }
+-  if (no_overlap) {
+-    return ITT_value(INONE);
+-  }
+-  if (intersect_1 == intersect_2) {
++        intersect_1.emplace(interp(p2, q2, p1, n1));
++        intersect_2.emplace(interp(p1, q1, p2, n2));
++      }
++    }
++  }
++  BLI_assert(intersect_1 && intersect_2);
++  if (*intersect_1 == *intersect_2) {
+     if (dbg_level > 0) {
+-      std::cout << "single intersect: " << intersect_1 << "\n";
+-    }
+-    return ITT_value(IPOINT, intersect_1);
++      std::cout << "single intersect: " << *intersect_1 << "\n";
++    }
++    return ITT_value(IPOINT, *intersect_1);
+   }
+   if (dbg_level > 0) {
+-    std::cout << "intersect segment: " << intersect_1 << ", " << intersect_2 << "\n";
+-  }
+-  return ITT_value(ISEGMENT, intersect_1, intersect_2);
++    std::cout << "intersect segment: " << *intersect_1 << ", " << *intersect_2 << "\n";
++  }
++  return ITT_value(ISEGMENT, *intersect_1, *intersect_2);
+ }
+ 
+ /* Helper function for intersect_tri_tri. Arguments have been canonicalized for triangle 1. */
+ 
+-static ITT_value itt_canon1(const mpq3 &p1,
+-                            const mpq3 &q1,
+-                            const mpq3 &r1,
+-                            const mpq3 &p2,
+-                            const mpq3 &q2,
+-                            const mpq3 &r2,
++static ITT_value itt_canon1(const Vert &p1,
++                            const Vert &q1,
++                            const Vert &r1,
++                            const Vert &p2,
++                            const Vert &q2,
++                            const Vert &r2,
+                             const mpq3 &n1,
+                             const mpq3 &n2,
+                             int sp2,
+@@ -1347,29 +1407,29 @@
+     return ITT_value(INONE);
+   }
+ 
+-  mpq3 buf[2];
+-  const mpq3 &p1 = vp1->co_exact;
+-  const mpq3 &q1 = vq1->co_exact;
+-  const mpq3 &r1 = vr1->co_exact;
+-  const mpq3 &p2 = vp2->co_exact;
+-  const mpq3 &q2 = vq2->co_exact;
+-  const mpq3 &r2 = vr2->co_exact;
++  std::optional<std::array<mpq3, 2>> scratch;
++  const auto exact_side = [&](const Vert &v, const Vert &plane_point, const mpq3 &n) {
++    auto &buf = scratch ? *scratch : scratch.emplace();
++    buf[0] = v.co_exact;
++    buf[0] -= plane_point.co_exact;
++    return sgn(math::dot_with_buffer(buf[0], n, buf[1]));
++  };
++  const Vert &p1 = *vp1;
++  const Vert &q1 = *vq1;
++  const Vert &r1 = *vr1;
++  const Vert &p2 = *vp2;
++  const Vert &q2 = *vq2;
++  const Vert &r2 = *vr2;
+ 
+   const mpq3 &n2 = tri2.plane->norm_exact;
+   if (sp1 == 0) {
+-    buf[0] = p1;
+-    buf[0] -= r2;
+-    sp1 = sgn(math::dot_with_buffer(buf[0], n2, buf[1]));
++    sp1 = exact_side(p1, r2, n2);
+   }
+   if (sq1 == 0) {
+-    buf[0] = q1;
+-    buf[0] -= r2;
+-    sq1 = sgn(math::dot_with_buffer(buf[0], n2, buf[1]));
++    sq1 = exact_side(q1, r2, n2);
+   }
+   if (sr1 == 0) {
+-    buf[0] = r1;
+-    buf[0] -= r2;
+-    sr1 = sgn(math::dot_with_buffer(buf[0], n2, buf[1]));
++    sr1 = exact_side(r1, r2, n2);
+   }
+ 
+   if (dbg_level > 1) {
+@@ -1389,19 +1449,13 @@
+   /* Repeat for signs of t2's vertices with respect to plane of t1. */
+   const mpq3 &n1 = tri1.plane->norm_exact;
+   if (sp2 == 0) {
+-    buf[0] = p2;
+-    buf[0] -= r1;
+-    sp2 = sgn(math::dot_with_buffer(buf[0], n1, buf[1]));
++    sp2 = exact_side(p2, r1, n1);
+   }
+   if (sq2 == 0) {
+-    buf[0] = q2;
+-    buf[0] -= r1;
+-    sq2 = sgn(math::dot_with_buffer(buf[0], n1, buf[1]));
++    sq2 = exact_side(q2, r1, n1);
+   }
+   if (sr2 == 0) {
+-    buf[0] = r2;
+-    buf[0] -= r1;
+-    sr2 = sgn(math::dot_with_buffer(buf[0], n1, buf[1]));
++    sr2 = exact_side(r2, r1, n1);
+   }
+ 
+   if (dbg_level > 1) {
+@@ -1488,9 +1542,13 @@
+   return ans;
+ }
+ 
++constexpr int max_linear_cdt_sites = 16;
++
+ struct CDT_data {
+   const Plane *t_plane;
+   Vector<mpq2> vert;
++  /** Original points on the triangle plane, owned by the mesh or intersection map. */
++  std::optional<Vector<const mpq3 *>> input_points;
+   Vector<int2> edge;
+   Vector<int> face_offsets;
+   Vector<int> face_vert_indices;
+@@ -1512,8 +1570,19 @@
+  */
+ static int prepare_need_vert(CDT_data &cd, const mpq3 &p3d)
+ {
+-  mpq2 p2d = project_3d_to_2d(p3d, cd.proj_axis);
+-  int v = cd.vert.append_and_get_index(p2d);
++  if (cd.input_points) {
++    /* Adjacent cutting segments often share an endpoint. Exact equality is required and each
++     * unique site keeps its original first-use order. Avoid a quadratic scan on dense sites. */
++    if (cd.input_points->size() <= max_linear_cdt_sites) {
++      for (const int index : cd.input_points->index_range()) {
++        if (*(*cd.input_points)[index] == p3d) {
++          return index;
++        }
++      }
++    }
++    cd.input_points->append(&p3d);
++  }
++  int v = cd.vert.append_and_get_index(project_3d_to_2d(p3d, cd.proj_axis));
+   return v;
+ }
+ 
+@@ -1599,24 +1668,32 @@
+   cd.is_reversed.append(rev);
+ }
+ 
+-static CDT_data prepare_cdt_input(const IMesh &tm, int t, const Span<ITT_value> itts)
++static CDT_data prepare_cdt_input(const IMesh &tm,
++                                  int t,
++                                  const Span<const ITT_value *> itts,
++                                  const bool single_plane)
+ {
+   CDT_data ans;
+   BLI_assert(tm.face(t)->plane_populated());
+   ans.t_plane = tm.face(t)->plane;
+   BLI_assert(ans.t_plane->exact_populated());
+   ans.proj_axis = math::dominant_axis(ans.t_plane->norm_exact);
++  if (single_plane) {
++    ans.input_points.emplace();
++    ans.input_points->reserve(3 + 2 * itts.size());
++  }
+   prepare_need_tri(ans, tm, t);
+-  for (const ITT_value &itt : itts) {
++  for (const ITT_value *intersection : itts) {
++    const ITT_value &itt = *intersection;
+     switch (itt.kind) {
+       case INONE:
+         break;
+       case IPOINT: {
+-        prepare_need_vert(ans, itt.p1);
++        prepare_need_vert(ans, *itt.p1);
+         break;
+       }
+       case ISEGMENT: {
+-        prepare_need_edge(ans, itt.p1, itt.p2);
++        prepare_need_edge(ans, *itt.p1, *itt.p2);
+         break;
+       }
+       case ICOPLANAR: {
+@@ -1649,11 +1726,11 @@
+   for (const ITT_value &itt : itts) {
+     switch (itt.kind) {
+       case IPOINT: {
+-        prepare_need_vert(ans, itt.p1);
++        prepare_need_vert(ans, *itt.p1);
+         break;
+       }
+       case ISEGMENT: {
+-        prepare_need_edge(ans, itt.p1, itt.p2);
++        prepare_need_edge(ans, *itt.p1, *itt.p2);
+         break;
+       }
+       default:
+@@ -1710,7 +1787,15 @@
+     }
+   }
+   cdt_in.epsilon = 0; /* TODO: needs attention for non-exact T. */
+-  cdt_in.needed_ids = CDT_ORIG_VERTS | CDT_ORIG_EDGES | CDT_ORIG_FACES;
++  /* Sparse inputs contain one triangle and finite intersections contained by it. Every
++   * interior output face maps to that triangle, so face provenance is implicit. */
++  cdt_in.needed_ids = CDT_ORIG_EDGES;
++  if (!cd.input_points) {
++    cdt_in.needed_ids |= CDT_ORIG_FACES;
++  }
++  else if (cd.input_points->size() > max_linear_cdt_sites) {
++    cdt_in.needed_ids |= CDT_ORIG_VERTS;
++  }
+   cd.cdt_out = delaunay_2d_calc(cdt_in, CDT_INSIDE);
+   constexpr int make_edge_map_threshold = 15;
+   if (cd.cdt_out.edge.size() >= make_edge_map_threshold) {
+@@ -1833,8 +1918,12 @@
+  * cdt_in_t. The triangle indices that are in cd.input_face are from IMesh tm.
+  * Return a pointer to the newly constructed Face.
+  */
+-static Face *cdt_tri_as_imesh_face(
+-    int cdt_out_t, int cdt_in_t, const CDT_data &cd, const IMesh &tm, IMeshArena *arena)
++static Face *cdt_tri_as_imesh_face(int cdt_out_t,
++                                     int cdt_in_t,
++                                     const CDT_data &cd,
++                                     const IMesh &tm,
++                                     IMeshArena *arena,
++                                     MutableSpan<const Vert *> vertices)
+ {
+   const CDT_result<mpq_class> &cdt_out = cd.cdt_out;
+   int t_orig = tm.face(cd.input_face[cdt_in_t])->orig;
+@@ -1842,15 +1931,40 @@
+   int i0 = cdt_out.face[cdt_out_t][0];
+   int i1 = cdt_out.face[cdt_out_t][1];
+   int i2 = cdt_out.face[cdt_out_t][2];
+-  mpq3 v0co = unproject_cdt_vert(cd, cdt_out.vert[i0]);
+-  mpq3 v1co = unproject_cdt_vert(cd, cdt_out.vert[i1]);
+-  mpq3 v2co = unproject_cdt_vert(cd, cdt_out.vert[i2]);
+-  /* No need to provide an original index: if coord matches
+-   * an original one, then it will already be in the arena
+-   * with the correct orig field. */
+-  const Vert *v0 = arena->add_or_find_vert(v0co, NO_INDEX);
+-  const Vert *v1 = arena->add_or_find_vert(v1co, NO_INDEX);
+-  const Vert *v2 = arena->add_or_find_vert(v2co, NO_INDEX);
++  /* CDT faces share output vertices. Unproject and intern each vertex on its first use
++   * so the order of vertex IDs and original indices stays unchanged. */
++  const auto vertex_for_index = [&](const int index) -> const Vert * {
++    const Vert *&vertex = vertices[index];
++    if (vertex == nullptr) {
++      /* With zero merge tolerance, an input site's 2D output still represents exactly the same
++       * point on the triangle plane. Only new CDT vertices need rational unprojection. */
++      int input_index = NO_INDEX;
++      if (cd.input_points) {
++        if (cdt_out.vert_orig.is_empty()) {
++          /* The small inputs were already deduplicated exactly. CDT emits distinct input
++           * vertices in input order, followed by any vertices created by intersections. */
++          if (index < cd.input_points->size()) {
++            input_index = index;
++          }
++        }
++        else if (!cdt_out.vert_orig[index].is_empty()) {
++          input_index = int(cdt_out.vert_orig[index].first());
++        }
++      }
++      if (input_index != NO_INDEX) {
++        const mpq3 &point = *(*cd.input_points)[input_index];
++        BLI_assert(point == unproject_cdt_vert(cd, cdt_out.vert[index]));
++        vertex = arena->add_or_find_vert(point, NO_INDEX);
++      }
++      else {
++        vertex = arena->add_or_find_vert(unproject_cdt_vert(cd, cdt_out.vert[index]), NO_INDEX);
++      }
++    }
++    return vertex;
++  };
++  const Vert *v0 = vertex_for_index(i0);
++  const Vert *v1 = vertex_for_index(i1);
++  const Vert *v2 = vertex_for_index(i2);
+   Face *facep;
+   bool is_isect0;
+   bool is_isect1;
+@@ -2206,9 +2320,10 @@
+   }
+   constexpr int inline_buf_size = 20;
+   Vector<Face *, inline_buf_size> faces;
++  Array<const Vert *, 16> vertices(cdt_out.vert.size(), nullptr);
+   for (int f : cdt_out.face.index_range()) {
+-    if (cdt_out.face_orig[f].contains(t_in_cdt)) {
+-      Face *facep = cdt_tri_as_imesh_face(f, t_in_cdt, cd, in_tm, arena);
++    if (cd.input_points || cdt_out.face_orig[f].contains(t_in_cdt)) {
++      Face *facep = cdt_tri_as_imesh_face(f, t_in_cdt, cd, in_tm, arena, vertices);
+       faces.append(facep);
+     }
+   }
+@@ -2304,6 +2419,21 @@
+             tree_, tree_, &overlap_num_, only_different_shapes, &cbdata);
+       }
+     }
++    /* Keep the general path for small overlaps and when buckets would be too sparse. */
++    constexpr uint min_bucket_pairs = 1 << 17;
++    if (dbg_level == 0 && two_trees_no_self && overlap_num_ >= min_bucket_pairs &&
++        overlap_num_ <= uint(std::numeric_limits<int>::max() / 2) &&
++        uint(tm.face_size()) <= overlap_num_)
++    {
++      if (BVHTreeOverlap *grouped = group_binary_overlaps(
++              this->overlap(), tm.face_size(), first_overlap_))
++      {
++        MEM_delete(overlap_);
++        overlap_ = grouped;
++        overlap_num_ *= 2;
++        return;
++      }
++    }
+     /* The rest of the code is simpler and easier to parallelize if, in the two-trees case,
+      * we repeat the overlaps with indexA and indexB reversed. It is important that
+      * in the repeated part, sorting will then bring things with indexB together. */
+@@ -2357,6 +2487,59 @@
+   }
+ 
+  private:
++  /*
++   * Gather both directions into one bucket per first triangle. The bucket entries
++   * store both indices, so sorting by the second triangle emits the same
++   * lexicographical sequence as the general path, including repeated pairs.
++   */
++  static BVHTreeOverlap *group_binary_overlaps(const Span<BVHTreeOverlap> pairs,
++                                                const int faces,
++                                                Array<int> &r_first)
++  {
++    const int directed_count = int(pairs.size() * 2);
++    BVHTreeOverlap *grouped = MEM_new_array_uninitialized<BVHTreeOverlap>(directed_count,
++                                                                        __func__);
++    if (grouped == nullptr) {
++      return nullptr;
++    }
++    /* This buffer is reused for counts, write cursors, end offsets and first indices. */
++    r_first = Array<int>(faces, 0);
++    for (const BVHTreeOverlap &pair : pairs) {
++      ++r_first[pair.indexA];
++      ++r_first[pair.indexB];
++    }
++    int offset = 0;
++    for (int &value : r_first) {
++      const int count = value;
++      value = offset;
++      offset += count;
++    }
++    BLI_assert(offset == directed_count);
++    for (const BVHTreeOverlap &pair : pairs) {
++      grouped[r_first[pair.indexA]++] = pair;
++      grouped[r_first[pair.indexB]++] = {pair.indexB, pair.indexA};
++    }
++    threading::parallel_for(r_first.index_range(), 128, [&](IndexRange range) {
++      for (const int face : range) {
++        const int begin = face == 0 ? 0 : r_first[face - 1];
++        const int end = r_first[face];
++        if (end - begin > 1) {
++          std::sort(grouped + begin, grouped + end, [](const BVHTreeOverlap &a,
++                                                    const BVHTreeOverlap &b) {
++            return a.indexB < b.indexB;
++          });
++        }
++      }
++    });
++    int begin = 0;
++    for (int &value : r_first) {
++      const int end = value;
++      value = end == begin ? -1 : begin;
++      begin = end;
++    }
++    return grouped;
++  }
++
+   static bool only_different_shapes(void *userdata, int index_a, int index_b, int /*thread*/)
+   {
+     CBData *cbdata = static_cast<CBData *>(userdata);
+@@ -2437,6 +2620,81 @@
+   settings.min_iter_per_thread = 1000;
+   settings.use_threading = intersect_use_threading;
+   BLI_task_parallel_range(0, tot_intersect_pairs, &data, calc_overlap_itts_range_func, &settings);
++}
++
++/**
++ * For large binary operations, keep only pairs with an actual intersection.
++ * The overlap list for two trees is sorted and contains both directions.
++ * Merge independent chunks in input order and leave the shared map read-only during CDT.
++ */
++static bool calc_sparse_overlap_itts(Map<std::pair<int, int>, ITT_value> &itt_map,
++                                     const IMesh &tm,
++                                     const Span<BVHTreeOverlap> overlaps)
++{
++  using Intersection = std::pair<std::pair<int, int>, ITT_value>;
++  constexpr int64_t chunk_size = 4096;
++  Array<Vector<Intersection>> chunks((overlaps.size() + chunk_size - 1) / chunk_size);
++  threading::parallel_for(chunks.index_range(), 1, [&](const IndexRange range) {
++    for (const int64_t chunk : range) {
++      Vector<Intersection> &hits = chunks[chunk];
++      const int64_t begin = chunk * chunk_size;
++      const int64_t end = std::min(begin + chunk_size, overlaps.size());
++      for (const int64_t i : IndexRange::from_begin_end(begin, end)) {
++        const BVHTreeOverlap &pair = overlaps[i];
++        if (pair.indexA > pair.indexB ||
++            (i > 0 && pair.indexA == overlaps[i - 1].indexA &&
++             pair.indexB == overlaps[i - 1].indexB))
++        {
++          continue;
++        }
++        ITT_value intersection = intersect_tri_tri(tm, pair.indexA, pair.indexB);
++        if (intersection.kind != INONE) {
++          hits.append({{pair.indexA, pair.indexB}, std::move(intersection)});
++        }
++      }
++    }
++  });
++
++  int64_t total = 0;
++  for (const Vector<Intersection> &chunk : chunks) {
++    total += chunk.size();
++    for (const Intersection &item : chunk) {
++      if (item.second.kind == ICOPLANAR) {
++        /* Cluster construction depends on iteration order in the original map. */
++        return false;
++      }
++    }
++  }
++  itt_map.reserve(total);
++  for (Vector<Intersection> &chunk : chunks) {
++    for (Intersection &item : chunk) {
++      itt_map.add_new(item.first, std::move(item.second));
++    }
++  }
++  return true;
++}
++
++/**
++ * Find the first corner emitted by the CDT of an isolated triangle.
++ * The initial triangulation adds the edge between the two lexicographically
++ * first sites. Output starts on the side of this edge that faces the triangle.
++ * Returning to the input winding leaves the first corner unchanged.
++ */
++static int isolated_cdt_first_corner(const Face &triangle)
++{
++  const mpq3 &normal = triangle.plane->norm_exact;
++  const int axis = math::dominant_axis(normal);
++  const int x = axis == 0 ? 1 : 0;
++  const int y = axis == 2 ? 1 : 2;
++  std::array<int, 3> sorted = {0, 1, 2};
++  std::sort(sorted.begin(), sorted.end(), [&](const int a, const int b) {
++    const mpq3 &left = triangle[a]->co_exact;
++    const mpq3 &right = triangle[b]->co_exact;
++    return left[x] == right[x] ? left[y] < right[y] : left[x] < right[x];
++  });
++  const bool projected_ccw = axis == 1 ? normal[axis] < 0 : normal[axis] > 0;
++  const bool order_preserved = sorted[1] == (sorted[0] + 1) % 3;
++  return sorted[projected_ccw == order_preserved ? 0 : 1];
+ }
+ 
+ /**
+@@ -2450,7 +2708,8 @@
+                                              const Map<std::pair<int, int>, ITT_value> &itt_map,
+                                              const CoplanarClusterInfo &clinfo,
+                                              const TriOverlaps &ov,
+-                                             IMeshArena *arena)
++                                             IMeshArena *arena,
++                                             const bool use_isolated_cdt)
+ {
+   const int dbg_level = 0;
+   if (dbg_level > 0) {
+@@ -2489,6 +2748,7 @@
+   }
+   int overlap_tri_range_num = overlap_tri_range.size();
+   Array<CDT_data> cd_data(overlap_tri_range_num);
++  Array<int8_t> isolated_first_corners(overlap_tri_range_num, -1);
+   int grain_size = 64;
+   threading::parallel_for(overlap_tri_range.index_range(), grain_size, [&](IndexRange range) {
+     for (int otr_index : range) {
+@@ -2498,30 +2758,47 @@
+         std::cout << "handling overlap range\nt=" << t << " start=" << otr.overlap_start
+                   << " len=" << otr.len << "\n";
+       }
+-      constexpr int inline_capacity = 100;
+-      Vector<ITT_value, inline_capacity> itts(otr.len);
++      Vector<const ITT_value *, 32> itts;
+       for (int j = otr.overlap_start; j < otr.overlap_start + otr.len; ++j) {
+         int t_other = overlap[j].indexB;
+         std::pair<int, int> key = canon_int_pair(t, t_other);
+-        ITT_value itt;
+-        if (itt_map.contains(key)) {
+-          itt = itt_map.lookup(key);
+-        }
+-        if (itt.kind != INONE) {
++        const ITT_value *itt = itt_map.lookup_ptr(key);
++        if (itt && itt->kind != INONE) {
+           itts.append(itt);
+         }
+-        if (dbg_level > 0) {
+-          std::cout << "  tri t" << t_other << "; result = " << itt << "\n";
++        if (dbg_level > 0 && itt) {
++          std::cout << "  tri t" << t_other << "; result = " << *itt << "\n";
+         }
+       }
+-      if (itts.size() > 0) {
+-        cd_data[otr_index] = prepare_cdt_input(tm, t, itts);
+-        do_cdt(cd_data[otr_index]);
+-      }
++      if (use_isolated_cdt && itts.is_empty()) {
++        isolated_first_corners[otr_index] = isolated_cdt_first_corner(*tm.face(t));
++        continue;
++      }
++      CDT_data &cd = cd_data[otr_index];
++      cd = prepare_cdt_input(tm, t, itts, use_isolated_cdt);
++      if (use_isolated_cdt && cd.vert.size() == 3 && cd.edge.is_empty()) {
++        isolated_first_corners[otr_index] = isolated_cdt_first_corner(*tm.face(t));
++        continue;
++      }
++      do_cdt(cd);
+     }
+   });
+   /* Extract the new faces serially, so that Boolean is repeatable regardless of parallelism. */
+   for (int otr_index : overlap_tri_range.index_range()) {
++    const int first = isolated_first_corners[otr_index];
++    if (first != -1) {
++      const int t = overlap_tri_range[otr_index].tri_index;
++      const Face &f = *tm.face(t);
++      const int second = (first + 1) % 3;
++      const int third = (first + 2) % 3;
++      Face *rotated = arena->add_face({f[first], f[second], f[third]},
++                                     f.orig,
++                                     {f.edge_orig[first], f.edge_orig[second], f.edge_orig[third]},
++                                     {false, false, false});
++      rotated->populate_plane(false);
++      r_tri_subdivided[t] = IMesh({rotated});
++      continue;
++    }
+     CDT_data &cdd = cd_data[otr_index];
+     if (cdd.vert.size() > 0) {
+       int t = overlap_tri_range[otr_index].tri_index;
+@@ -2569,9 +2846,10 @@
+     const CDT_result<mpq_class> &cdt_out = cd.cdt_out;
+     BLI_assert(cd.input_face.size() == n_cluster_tris);
+     Array<Vector<Face *>> face_vec(n_cluster_tris);
++    Array<const Vert *, 16> vertices(cdt_out.vert.size(), nullptr);
+     for (int cdt_out_t : cdt_out.face.index_range()) {
+       for (int cdt_in_t : cdt_out.face_orig[cdt_out_t]) {
+-        Face *f = cdt_tri_as_imesh_face(cdt_out_t, cdt_in_t, cd, tm, arena);
++        Face *f = cdt_tri_as_imesh_face(cdt_out_t, cdt_in_t, cd, tm, arena, vertices);
+         face_vec[cdt_in_t].append(f);
+       }
+     }
+@@ -2910,8 +3188,14 @@
+   /* itt_map((a,b)) will hold the intersection value resulting from intersecting
+    * triangles with indices a and b, where a < b. */
+   Map<std::pair<int, int>, ITT_value> itt_map;
+-  itt_map.reserve(tri_ov.overlap().size());
+-  calc_overlap_itts(itt_map, *tm_clean, tri_ov, arena);
++  constexpr int64_t min_sparse_overlaps = 65536;
++  const bool use_sparse = nshapes == 2 && !use_self &&
++                          tri_ov.overlap().size() >= min_sparse_overlaps &&
++                          calc_sparse_overlap_itts(itt_map, *tm_clean, tri_ov.overlap());
++  if (!use_sparse) {
++    itt_map.reserve(tri_ov.overlap().size());
++    calc_overlap_itts(itt_map, *tm_clean, tri_ov, arena);
++  }
+ #  ifdef PERFDEBUG
+   double itt_time = BLI_time_now_seconds();
+   std::cout << "itts found, time = " << itt_time - plane_populate << "\n";
+@@ -2927,7 +3211,8 @@
+   doperfmax(1, clinfo.tot_cluster());
+   doperfmax(2, tri_ov.overlap().size());
+ #  endif
+-  calc_subdivided_non_cluster_tris(tri_subdivided, *tm_clean, itt_map, clinfo, tri_ov, arena);
++  calc_subdivided_non_cluster_tris(
++      tri_subdivided, *tm_clean, itt_map, clinfo, tri_ov, arena, use_sparse);
+ #  ifdef PERFDEBUG
+   double subdivided_tris_time = BLI_time_now_seconds();
+   std::cout << "subdivided non-cluster tris found, time = " << subdivided_tris_time - itt_time
+@@ -2995,10 +3280,10 @@
+       os << "none";
+       break;
+     case IPOINT:
+-      os << "point " << itt.p1;
++      os << "point " << *itt.p1;
+       break;
+     case ISEGMENT:
+-      os << "segment " << itt.p1 << " " << itt.p2;
++      os << "segment " << *itt.p1 << " " << *itt.p2;
+       break;
+     case ICOPLANAR:
+       os << "co-planar t" << itt.t_source;

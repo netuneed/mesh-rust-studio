@@ -1,0 +1,109 @@
+diff --git a/source/blender/geometry/CMakeLists.txt b/source/blender/geometry/CMakeLists.txt
+--- a/source/blender/geometry/CMakeLists.txt
++++ b/source/blender/geometry/CMakeLists.txt
+@@ -165,6 +165,12 @@
+ blender_add_lib(bf_geometry "${SRC}" "${INC}" "${INC_SYS}" "${LIB}")
+ add_library(bf::geometry ALIAS bf_geometry)
+ 
++if(WITH_MANIFOLD AND BLENDER_RUST_SCREEN_SPLIT_LIB)
++  target_compile_definitions(bf_geometry PRIVATE WITH_BLENDER_RUST_BOOLEAN_GROUPS)
++  target_link_libraries(bf_geometry PRIVATE "${BLENDER_RUST_SCREEN_SPLIT_LIB}")
++endif()
++
++
+ if(WITH_GTESTS)
+   set(TEST_INC
+   )
+diff --git a/source/blender/geometry/intern/mesh_boolean_manifold.cc b/source/blender/geometry/intern/mesh_boolean_manifold.cc
+--- a/source/blender/geometry/intern/mesh_boolean_manifold.cc
++++ b/source/blender/geometry/intern/mesh_boolean_manifold.cc
+@@ -10,6 +10,7 @@
+ #  include <algorithm>
+ #  include <iomanip>
+ #  include <iostream>
++#  include <stdexcept>
+ 
+ #  include "BLI_array.hh"
+ #  include "BLI_array_utils.hh"
+@@ -828,6 +829,49 @@
+  * is a Vector of the \a mgl triangles that derive from the i'th input
+  * face (where i is an index in the concatenated input mesh face space).
+  */
++#  ifdef WITH_BLENDER_RUST_BOOLEAN_GROUPS
++extern "C" uint8_t blender_rust_boolean_group_triangles(const uint32_t *face_ids,
++                                                         size_t triangle_count,
++                                                         int32_t *offsets,
++                                                         size_t face_count,
++                                                         int32_t *triangles);
++
++struct PackedFaceGroups {
++  Array<int> offsets;
++  Array<int> triangles;
++
++  int64_t size() const
++  {
++    return offsets.size() - 1;
++  }
++
++  IndexRange index_range() const
++  {
++    return IndexRange(this->size());
++  }
++
++  Span<int> operator[](const int index) const
++  {
++    return triangles.as_span().slice(offsets[index], offsets[index + 1] - offsets[index]);
++  }
++};
++
++static PackedFaceGroups get_face_groups(const MeshGL &mgl, const int input_faces_num)
++{
++#    ifdef DEBUG_TIME
++  timeit::ScopedTimer timer("get_face_groups (Rust)");
++#    endif
++  const int tris_num = mgl.NumTri();
++  BLI_assert(mgl.faceID.size() == tris_num);
++  PackedFaceGroups groups{Array<int>(int64_t(input_faces_num) + 1, 0), Array<int>(tris_num, 0)};
++  if (!blender_rust_boolean_group_triangles(
++          mgl.faceID.data(), tris_num, groups.offsets.data(), input_faces_num, groups.triangles.data()))
++  {
++    throw std::runtime_error("Invalid face IDs in the Manifold Boolean result");
++  }
++  return groups;
++}
++#  else
+ static Array<Vector<int, face_group_inline>> get_face_groups(const MeshGL &mgl,
+                                                              int input_faces_num)
+ {
+@@ -851,6 +895,7 @@
+   }
+   return fg;
+ }
++#  endif
+ 
+ #  if 0
+ /* TODO: later */
+@@ -1445,12 +1490,12 @@
+   const int input_faces_num = mesh_offsets.face_start.last();
+ 
+   /* For each offset input mesh face, what mgl triangles have it as id? */
+-  Array<Vector<int, face_group_inline>> face_groups = get_face_groups(mgl, input_faces_num);
++  const auto face_groups = get_face_groups(mgl, input_faces_num);
+   if (dbg_level > 1) {
+     std::cout << "groups:\n";
+     for (const int i : face_groups.index_range()) {
+       std::cout << "orig (offset) face " << i << ": ";
+-      dump_span(face_groups[i].as_span(), "");
++      dump_span(Span<int>(face_groups[i]), "");
+     }
+   }
+   {
+@@ -1461,7 +1506,7 @@
+     const int grain_size = 15000;
+     threading::parallel_for(face_groups.index_range(), grain_size, [&](const IndexRange range) {
+       for (const int gid : range) {
+-        const Span<int> group = face_groups[gid].as_span();
++        const Span<int> group = face_groups[gid];
+         Vector<OutFace> &group_faces = new_groups[gid] = Vector<OutFace, 4>(group.size());
+         for (const int i : group_faces.index_range()) {
+           int tri_index = group[i];

@@ -3,6 +3,7 @@
 
 mod bmesh_pool;
 mod bmesh_quads;
+mod boolean_faces;
 mod curve_ring;
 mod deform;
 mod edit_mesh;

@@ -51,7 +51,13 @@ $patches = @(
     'blender-v5.3.0-bmesh-uv-pin-layout.patch',
     'blender-v5.3.0-work-desktop.patch',
     'blender-v5.3.0-gpu-patch-array-cache.patch',
-    'blender-v5.3.0-smart-uv-direction-search.patch'
+    'blender-v5.3.0-smart-uv-direction-search.patch',
+    'blender-v5.3.0-exact-sparse-intersections.patch',
+    'blender-v5.3.0-exact-topology-cache.patch',
+    'blender-v5.3.0-boolean-plus-manifold.patch',
+    'blender-v5.3.0-file-smoothscroll-timer.patch',
+    'blender-v5.3.0-boolean-plus-card.patch',
+    'blender-v5.3.0-public-desktop.patch'
 )
 $gpuRoot = Join-Path $env:LOCALAPPDATA 'Blender-Rust-Port'
 $gpuCache = Join-Path $env:LOCALAPPDATA 'Temp/blender-rust-port-5.3-cmake'
@@ -153,6 +159,7 @@ if ((Invoke-Checked git @('-C', $source, 'rev-parse', 'HEAD')) -ne $base) {
     throw "Expected the isolated source checkout at $base."
 }
 $buildPatches = @($patches | ForEach-Object { Join-Path $PSScriptRoot $_ })
+Copy-Item -LiteralPath (Join-Path $root 'distribution/windows/MeshRustStudio.ico') -Destination (Join-Path $source 'release/windows/icons/meshruststudio.ico') -Force
 $alreadyApplied = @()
 $restored = @()
 # A later patch may replace context used by an earlier one. Undo known patches
@@ -241,7 +248,7 @@ $configureArguments = @('-S', $source, '-B', $BinaryDirectory, '-G', 'Ninja',
     "-DCMAKE_INSTALL_PREFIX=$package",
     "-DBLENDER_RUST_SCREEN_SPLIT_LIB=$rustLibrary", '-DWITH_BLENDER_RUST_EDIT_MESH=ON',
     '-DWITH_PYTHON=ON', '-DWITH_PYTHON_INSTALL=ON',
-    '-DWITH_TBB=ON', '-DWITH_CODEC_FFMPEG=ON', '-DWITH_OPENGL_BACKEND=ON',
+    '-DWITH_TBB=ON', '-DWITH_TBB_MALLOC_PROXY=OFF', '-DWITH_CODEC_FFMPEG=ON', '-DWITH_OPENGL_BACKEND=ON',
     '-DWITH_CYCLES=ON', '-DWITH_CYCLES_OSL=OFF', '-DWITH_CYCLES_PATH_GUIDING=OFF',
     '-DWITH_CYCLES_DEVICE_HIP=OFF',
     '-DWITH_CYCLES_DEVICE_ONEAPI=OFF', '-DWITH_GTESTS=OFF', '-DWITH_XR_OPENXR=OFF',
