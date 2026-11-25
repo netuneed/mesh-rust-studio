@@ -53,7 +53,7 @@ To update, close Mesh Rust Studio, extract the replacement ZIP to a new folder a
 
 ## Modeling tools in Work
 
-- **Add Modifier → Mesh Rust Studio → Auto UV** unwraps the mesh produced by earlier modifiers. It writes a separate UV map named `Auto UV` by default. Select that map in the material's UV Map node to use it.
+- **Add Modifier > Blender Plus > Auto UV** unwraps the mesh produced by earlier modifiers. It writes a separate UV map named `Auto UV` by default. Select that map in the material's UV Map node to use it.
 - **N → Mesh Rust Studio → Topology** runs QuadriFlow, Reduce Polygons or Simplify Flat Areas on the evaluated mesh. The tool creates a separate object. **Update Topology** recalculates the selected result from its source. Attribute reprojection, including UVs, is approximate.
 
 Try Dev on a copy of an important project. Check the release notes for any Blender features or add-ons your workflow depends on.

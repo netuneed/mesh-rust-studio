@@ -143,7 +143,7 @@ def assemble(args):
         for line in catalog.read_text("utf-8").splitlines()
         if not line.startswith(AUTO_UV_CATALOG + ":")
     ]
-    rows.append(AUTO_UV_CATALOG + ":Mesh Rust Studio:Mesh Rust Studio")
+    rows.append(AUTO_UV_CATALOG + ":Blender+ RUST:Blender+ RUST")
     catalog.write_text("\n".join(rows) + "\n", encoding="utf-8")
     (out / "edition.txt").write_text("work\n", encoding="ascii")
     copy(DIST / "MeshRustStudio-splash.png", out / "MeshRustStudio-splash.png")
